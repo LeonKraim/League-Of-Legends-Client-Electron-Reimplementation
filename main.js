@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, ipcMain, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog } = require('electron');
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -9,23 +9,22 @@ const { extractWAD } = require('@lol-archiver/lol-wad-extract');
 
 process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
 
+const cfg = require('./path-config');
 const DEBUG = process.env.DEBUG_LEAGUE_ELECTRON === '1';
 const LEAGUE_UA = 'Mozilla/5.0 LeagueOfLegendsClient/16.10.777.2413 (CEF 108)';
-const LEAGUE_DIR = 'C:\\Riot Games\\League of Legends';
-const LEAGUE_CLIENT_EXE = path.join(LEAGUE_DIR, 'LeagueClient.exe');
-const RIOT_CLIENT_DIR = 'C:\\Riot Games\\Riot Client';
-const RIOT_CLIENT_SERVICES_EXE = path.join(RIOT_CLIENT_DIR, 'RiotClientServices.exe');
-const PLUGINS_DIR = path.join(LEAGUE_DIR, 'Plugins');
 const FRONTEND_PREFIX = 'rcp-fe-';
 const STATIC_PLUGIN = 'rcp-fe-lol-static-assets';
 const LEAGUE_START_TIMEOUT_MS = 120000;
 const LEAGUE_START_POLL_MS = 1000;
 const LEAGUE_READY_TIMEOUT_MS = 120000;
+const LOCAL_REQUEST_TIMEOUT_MS = 8000;
 const WINDOW_SIZES = [
   { width: 1024, height: 576, scale: 0.8 },
   { width: 1280, height: 720, scale: 1 },
   { width: 1600, height: 900, scale: 1.25 }
 ];
+let shuttingDownLeaguePromise = null;
+let allowingWindowClose = false;
 
 process.on('uncaughtException', (error) => {
   console.error(`[main:uncaught] ${error.stack || error.message}`);
@@ -120,6 +119,21 @@ function readLeagueUxProcess() {
   };
 }
 
+function readLeagueClientProcess() {
+  const ps = [
+    '-NoProfile',
+    '-Command',
+    "$process = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'LeagueClient.exe' } | Select-Object -First 1 ProcessId, CommandLine; if ($process) { $process | ConvertTo-Json -Compress }"
+  ];
+  const output = execFileSync('powershell.exe', ps, { encoding: 'utf8' }).trim();
+  if (!output) return null;
+  const parsed = JSON.parse(output);
+  return {
+    pid: Number(parsed.ProcessId),
+    commandLine: parsed.CommandLine || ''
+  };
+}
+
 function readRiotClientProcess() {
   const ps = [
     '-NoProfile',
@@ -160,33 +174,16 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function startLeagueClient() {
-  if (fs.existsSync(RIOT_CLIENT_SERVICES_EXE)) {
-    execFileSync('powershell.exe', [
-      '-NoProfile',
-      '-Command',
-      "& '.\\RiotClientServices.exe' --launch-product=league_of_legends --launch-patchline=live"
-    ], {
-      encoding: 'utf8',
-      cwd: RIOT_CLIENT_DIR
-    });
-    return;
-  }
-
-  if (!fs.existsSync(LEAGUE_CLIENT_EXE)) {
-    throw new Error(`League client launch target not found. Checked: ${RIOT_CLIENT_SERVICES_EXE} and ${LEAGUE_CLIENT_EXE}`);
-  }
-
-  execFileSync('powershell.exe', [
-    '-NoProfile',
-    '-Command',
-    `Start-Process -FilePath '${LEAGUE_CLIENT_EXE.replace(/'/g, "''")}' -WindowStyle Hidden`
-  ], { encoding: 'utf8' });
-}
-
-function requestRiotClient(path, port, token, method = 'GET', body = null) {
+function requestLocalClient({ path, port, token, method = 'GET', body = null, accept }) {
   return new Promise((resolve) => {
     const payload = body ? Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)) : null;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
     const req = https.request({
       hostname: '127.0.0.1',
       port,
@@ -195,7 +192,7 @@ function requestRiotClient(path, port, token, method = 'GET', body = null) {
       rejectUnauthorized: false,
       auth: `riot:${token}`,
       headers: {
-        Accept: 'application/json, text/plain, */*',
+        Accept: accept,
         'User-Agent': LEAGUE_UA,
         ...(payload ? {
           'content-type': 'application/json',
@@ -206,12 +203,54 @@ function requestRiotClient(path, port, token, method = 'GET', body = null) {
       let responseBody = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { responseBody += chunk; });
-      res.on('end', () => resolve({ path, statusCode: res.statusCode, body: responseBody }));
+      res.on('end', () => finish({ path, statusCode: res.statusCode, body: responseBody }));
     });
 
-    req.on('error', (error) => resolve({ path, error }));
+    req.setTimeout(LOCAL_REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error(`Timed out requesting ${path} after ${LOCAL_REQUEST_TIMEOUT_MS}ms.`));
+    });
+    req.on('error', (error) => finish({ path, error }));
     if (payload) req.write(payload);
     req.end();
+  });
+}
+
+function quotePowerShellSingle(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+function startLeagueClient() {
+  if (cfg.riotClientServicesExe && fs.existsSync(cfg.riotClientServicesExe)) {
+    execFileSync('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      "& '.\\RiotClientServices.exe' --launch-product=league_of_legends --launch-patchline=live"
+    ], {
+      encoding: 'utf8',
+      cwd: cfg.riotDir
+    });
+    return;
+  }
+
+  if (!cfg.leagueClientExe || !fs.existsSync(cfg.leagueClientExe)) {
+    throw new Error(`League client launch target not found. Checked: ${cfg.riotClientServicesExe} and ${cfg.leagueClientExe}`);
+  }
+
+  execFileSync('powershell.exe', [
+    '-NoProfile',
+    '-Command',
+    `Start-Process -FilePath '${cfg.leagueClientExe.replace(/'/g, "''")}' -WindowStyle Hidden`
+  ], { encoding: 'utf8' });
+}
+
+function requestRiotClient(path, port, token, method = 'GET', body = null) {
+  return requestLocalClient({
+    path,
+    port,
+    token,
+    method,
+    body,
+    accept: 'application/json, text/plain, */*'
   });
 }
 
@@ -229,26 +268,43 @@ function startLeagueFromLaunchConfiguration(launchConfiguration) {
     throw new Error('Missing Riot launch configuration for League.');
   }
 
-  const executable = launchConfiguration.executable.replace(/"/g, '""');
-  const workingDirectory = launchConfiguration.workingDirectory.replace(/"/g, '""');
+  const executable = quotePowerShellSingle(launchConfiguration.executable);
+  const workingDirectory = quotePowerShellSingle(launchConfiguration.workingDirectory);
   const arguments = Array.isArray(launchConfiguration.arguments)
-    ? launchConfiguration.arguments.map((value) => {
-        const stringValue = String(value).replace(/"/g, '""');
-        return `"${stringValue}"`;
-      }).join(' ')
+    ? launchConfiguration.arguments.map((value) => `'${quotePowerShellSingle(value)}'`).join(', ')
     : '';
 
-  execFileSync('cmd.exe', [
-    '/c',
-    `cd /d "${workingDirectory}" && start "" "${executable}" ${arguments}`
+  execFileSync('powershell.exe', [
+    '-NoProfile',
+    '-Command',
+    `$argList = @(${arguments}); Start-Process -FilePath '${executable}' -WorkingDirectory '${workingDirectory}' -ArgumentList $argList -WindowStyle Hidden`
   ], { encoding: 'utf8' });
+}
+
+async function relaunchLeagueProductFromRiotClient(riot) {
+  const path = '/product-launcher/v1/products/league_of_legends/patchlines/live';
+  await requestRiotClient(path, riot.port, riot.token, 'DELETE');
+  const launchResponse = await requestRiotClient(path, riot.port, riot.token, 'POST');
+  return !launchResponse.error && launchResponse.statusCode && launchResponse.statusCode < 400;
 }
 
 async function forceLeagueUxLaunchFromRiotClient() {
   const riot = readRiotClientArgs();
+  const headlessLeague = !!readLeagueClientProcess();
+  if (headlessLeague) {
+    const relaunched = await relaunchLeagueProductFromRiotClient(riot);
+    if (relaunched) return true;
+  }
+
   const launchResponse = await requestRiotClient('/product-launcher/v1/products/league_of_legends/patchlines/live', riot.port, riot.token, 'POST');
   if (!launchResponse.error && launchResponse.statusCode && launchResponse.statusCode < 400) {
     return true;
+  }
+
+  const alreadyLaunched = launchResponse.statusCode === 423 && /already_launched/i.test(launchResponse.body || '');
+  if (alreadyLaunched) {
+    const relaunched = await relaunchLeagueProductFromRiotClient(riot);
+    if (relaunched) return true;
   }
 
   const sessionsResponse = await requestRiotClient('/product-session/v1/external-sessions', riot.port, riot.token);
@@ -272,9 +328,13 @@ async function ensureLeagueIsRunning() {
     };
   }
 
-  startLeagueClient();
+  const existingHeadlessLeague = readLeagueClientProcess();
+  if (!existingHeadlessLeague) {
+    startLeagueClient();
+  }
   const startedAt = Date.now();
   let forcedLaunchAttempted = false;
+  let headlessLeagueSince = existingHeadlessLeague ? Date.now() : null;
 
   while (Date.now() - startedAt < LEAGUE_START_TIMEOUT_MS) {
     const leagueProcess = readLeagueUxProcess();
@@ -290,12 +350,24 @@ async function ensureLeagueIsRunning() {
       }
     }
 
+    const headlessLeague = !!readLeagueClientProcess();
+    if (headlessLeague) {
+      if (!headlessLeagueSince) headlessLeagueSince = Date.now();
+    } else {
+      headlessLeagueSince = null;
+    }
+
     if (!forcedLaunchAttempted) {
       try {
         const riot = readRiotClientArgs();
         const phaseResponse = await requestRiotClient('/riot-client-lifecycle/v1/product-context-phase', riot.port, riot.token);
         const phase = parseJsonString(phaseResponse.body);
-        if (phase === 'WaitForLaunch' || phase === 'WaitForSessionExit') {
+        const stuckHeadlessLeague = headlessLeague && headlessLeagueSince && (Date.now() - headlessLeagueSince >= 5000);
+        if (
+          phase === 'WaitForLaunch' ||
+          phase === 'WaitForSessionExit' ||
+          (phase === 'AppRepairAndUpdate' && stuckHeadlessLeague)
+        ) {
           forcedLaunchAttempted = await forceLeagueUxLaunchFromRiotClient();
         }
       } catch (_error) {
@@ -319,6 +391,87 @@ async function requestLeagueUxShutdown(league) {
   }
 }
 
+async function dismissStockLeagueUx(league, options = {}) {
+  const attempts = options.attempts || 8;
+  const delayMs = options.delayMs || 750;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await requestLeagueUxShutdown(league);
+      return true;
+    } catch (error) {
+      lastError = error;
+      await delay(delayMs);
+    }
+  }
+
+  if (lastError) throw lastError;
+  return false;
+}
+
+async function suppressStockLeagueUxAfterLoad(league, options = {}) {
+  const totalMs = options.totalMs || 30000;
+  const pollMs = options.pollMs || 1000;
+  const startedAt = Date.now();
+  let lastError = null;
+
+  while (Date.now() - startedAt < totalMs) {
+    if (readLeagueUxProcess()) {
+      try {
+        await dismissStockLeagueUx(league, { attempts: 2, delayMs: 500 });
+        console.log('[league:kill-ux] dismissed stock League UX window');
+        return true;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    await delay(pollMs);
+  }
+
+  if (lastError) {
+    console.error(`[league:kill-ux] ${lastError.message}`);
+  }
+  return false;
+}
+
+async function requestLeagueServerShutdown(league) {
+  if (!league) return;
+
+  const shutdownPath = '/product-launcher/v1/products/league_of_legends/patchlines/live';
+  if (league.riotPort && league.riotToken) {
+    const riotResult = await requestRiotClient(shutdownPath, league.riotPort, league.riotToken, 'DELETE');
+    if (!riotResult.error && riotResult.statusCode && riotResult.statusCode < 500) {
+      return;
+    }
+  }
+
+  const leagueResult = await requestLeague('/process-control/v1/process/quit', league.port, league.token, 'POST');
+  if (leagueResult.error) throw leagueResult.error;
+  if (leagueResult.statusCode && leagueResult.statusCode >= 400) {
+    throw new Error(`League shutdown refused with status ${leagueResult.statusCode}.`);
+  }
+}
+
+function shutdownLeagueAndQuit(win) {
+  if (shuttingDownLeaguePromise) return shuttingDownLeaguePromise;
+
+  shuttingDownLeaguePromise = (async () => {
+    if (win && win.league) {
+      try {
+        await requestLeagueServerShutdown(win.league);
+      } catch (error) {
+        console.error(`[league:shutdown] ${error.message}`);
+      }
+    }
+    allowingWindowClose = true;
+    if (win && !win.isDestroyed()) win.close();
+    app.quit();
+  })();
+
+  return shuttingDownLeaguePromise;
+}
+
 async function waitForLeagueReady(league) {
   const startedAt = Date.now();
   let lastError = 'League client HTTP interface did not become ready.';
@@ -338,13 +491,13 @@ async function waitForLeagueReady(league) {
   throw new Error(`League client did not become ready within ${LEAGUE_READY_TIMEOUT_MS / 1000} seconds. Last error: ${lastError}`);
 }
 
-function buildLoadingHtml(statusText = 'Starting League Client...') {
+function buildLoadingHtml() {
   return `<!doctype html>
   <html>
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Loading</title>
+      <title>Starting Electron League Client</title>
       <style>
         :root {
           color-scheme: dark;
@@ -461,8 +614,7 @@ function buildLoadingHtml(statusText = 'Starting League Client...') {
     <body>
       <main class="panel">
         <div class="crest" aria-hidden="true"></div>
-        <h1>League Electron Client</h1>
-        <p>${statusText}</p>
+        <h1>Starting Electron League Client</h1>
         <div class="bar" aria-hidden="true"></div>
       </main>
     </body>
@@ -474,10 +626,10 @@ function readJson(file) {
 }
 
 function getPlugins() {
-  const manifest = readJson(path.join(PLUGINS_DIR, 'plugin-manifest.json'));
+  const manifest = readJson(path.join(cfg.pluginsDir, 'plugin-manifest.json'));
   return manifest.plugins
     .map((plugin) => {
-      const descriptionPath = path.join(PLUGINS_DIR, plugin.name, 'description.json');
+      const descriptionPath = path.join(cfg.pluginsDir, plugin.name, 'description.json');
       if (!fs.existsSync(descriptionPath)) return null;
       return { ...plugin, description: readJson(descriptionPath) };
     })
@@ -532,7 +684,7 @@ function buildIndexHtml(league, bridgePort) {
     if (plugin.name === 'rcp-fe-plugin-runner') continue;
     const segment = urlSegmentForPlugin(plugin.name);
     const cssName = plugin.name === 'rcp-fe-lol-uikit' ? 'main.css' : `${plugin.name}.css`;
-    const wadPath = path.join(PLUGINS_DIR, plugin.name, 'assets.wad');
+    const wadPath = path.join(cfg.pluginsDir, plugin.name, 'assets.wad');
     cssLinks.push({ plugin, href: `/fe/${segment}/${cssName}`, wadPath, fileInpack: `plugins/${plugin.name}/global/default/${cssName}` });
     scriptTags.push(`<script src='/fe/${segment}/${plugin.name}.js?t=${timestamp}'></script>`);
   }
@@ -902,7 +1054,7 @@ function pluginNameForSegment(segment) {
 function wadFilesForPlugin(pluginName) {
   if (wadFilesCache.has(pluginName)) return wadFilesCache.get(pluginName);
 
-  const pluginDir = path.join(PLUGINS_DIR, pluginName);
+  const pluginDir = path.join(cfg.pluginsDir, pluginName);
   if (!fs.existsSync(pluginDir)) return [];
 
   const wadFiles = fs.readdirSync(pluginDir)
@@ -1056,7 +1208,7 @@ async function handleRiotInvoke(win, payload) {
     case 'RiotClient.SignOut':
     case 'RiotClient.Logout':
       await requestLeague('/lol-login/v1/session', win.league.port, win.league.token, 'DELETE');
-      win.close();
+      await shutdownLeagueAndQuit(win);
       return undefined;
     case 'Browser.OpenExternal':
     case 'Window.OpenExternal':
@@ -1283,33 +1435,13 @@ function startBridgeServer(league) {
 }
 
 function requestLeague(path, port, token, method = 'GET', body = null) {
-  return new Promise((resolve) => {
-    const payload = body ? Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)) : null;
-    const req = https.request({
-      hostname: '127.0.0.1',
-      port,
-      path,
-      method,
-      rejectUnauthorized: false,
-      auth: `riot:${token}`,
-      headers: {
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'User-Agent': LEAGUE_UA,
-        ...(payload ? {
-          'content-type': 'application/json',
-          'content-length': payload.length
-        } : {})
-      }
-    }, (res) => {
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => resolve({ path, statusCode: res.statusCode, body }));
-    });
-
-    req.on('error', (error) => resolve({ path, error }));
-    if (payload) req.write(payload);
-    req.end();
+  return requestLocalClient({
+    path,
+    port,
+    token,
+    method,
+    body,
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
   });
 }
 
@@ -1337,14 +1469,14 @@ function createShellWindow() {
   return win;
 }
 
-async function showLoadingScreen(win, statusText) {
-  await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(buildLoadingHtml(statusText))}`);
+async function showLoadingScreen(win) {
+  await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(buildLoadingHtml())}`);
 }
 
 async function createWindow() {
   Menu.setApplicationMenu(null);
   const win = createShellWindow();
-  await showLoadingScreen(win, 'Waiting for the League client and local bridge to become ready.');
+  await showLoadingScreen(win);
 
   session.defaultSession.setUserAgent(LEAGUE_UA);
   session.defaultSession.setCertificateVerifyProc((_request, callback) => {
@@ -1398,6 +1530,16 @@ async function createWindow() {
     console.error('[electron] renderer unresponsive');
   });
 
+  win.on('close', (event) => {
+    if (allowingWindowClose) return;
+    event.preventDefault();
+    shutdownLeagueAndQuit(win).catch((error) => {
+      console.error(`[league:shutdown] ${error.message}`);
+      allowingWindowClose = true;
+      if (!win.isDestroyed()) win.close();
+    });
+  });
+
   win.webContents.on('did-finish-load', async () => {
     const location = await win.webContents.executeJavaScript('location.href').catch(() => '');
     console.log(`[electron] loaded ${location}`);
@@ -1445,18 +1587,11 @@ async function createWindow() {
     setTimeout(() => captureDebugState('25s'), 25000);
   });
 
-  await showLoadingScreen(win, 'Checking whether League is already running.');
+  await showLoadingScreen(win);
   const startup = await ensureLeagueIsRunning();
   const league = startup.league;
   win.league = league;
   const baseUrl = `https://127.0.0.1:${league.port}`;
-
-  await showLoadingScreen(
-    win,
-    startup.startedByApp
-      ? 'League was started for you. Finalizing the local bridge and switching over as soon as it is ready.'
-      : 'League is already running. Connecting to the local bridge now.'
-  );
 
   await waitForLeagueReady(league);
   const bridge = await startBridgeServer(league);
@@ -1478,14 +1613,37 @@ async function createWindow() {
 
   console.log(`[league] Loading bridge for ${baseUrl}/bootstrap.html`);
   await win.loadURL(`http://127.0.0.1:${bridge.port}/index.html`);
-  if (startup.startedByApp && startup.startedUxPid) {
-    await requestLeagueUxShutdown(league);
+  if (startup.startedByApp) {
+    suppressStockLeagueUxAfterLoad(league).catch((error) => {
+      console.error(`[league:kill-ux] ${error.message}`);
+    });
   }
 }
 
-app.whenReady().then(createWindow).catch((error) => {
+if (cfg.configError) {
+  dialog.showErrorBox('League Client Path Error', cfg.configError);
+}
+
+app.whenReady().then(async () => {
+  if (cfg.configError) {
+    app.quit();
+    return;
+  }
+  await createWindow();
+}).catch((error) => {
   console.error(error);
   app.quit();
+});
+
+app.on('before-quit', (event) => {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (allowingWindowClose || !win || win.isDestroyed()) return;
+  event.preventDefault();
+  shutdownLeagueAndQuit(win).catch((error) => {
+    console.error(`[league:shutdown] ${error.message}`);
+    allowingWindowClose = true;
+    app.quit();
+  });
 });
 
 app.on('window-all-closed', () => {

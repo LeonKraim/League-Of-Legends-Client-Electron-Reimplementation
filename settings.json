@@ -1,0 +1,5 @@
+{
+  "_comment": "Example: \"leagueClientDir\": \"C:\\\\Riot Games\\\\League of Legends\", \"riotClientDir\": \"C:\\\\Riot Games\\\\Riot Client\". Leave each as \"\" to use auto-detection.",
+  "leagueClientDir": "",
+  "riotClientDir": ""
+}
