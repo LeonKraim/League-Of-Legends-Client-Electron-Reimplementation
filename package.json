@@ -1,17 +1,20 @@
 {
-  "name": "new-folder-(7)",
+  "name": "league-electron-client",
   "version": "1.0.0",
-  "description": "",
+  "description": "Frameless Electron shell for the League of Legends client",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "check:league": "node scripts/check-league.js"
+    "check:league": "node scripts/check-league.js",
+    "build": "node scripts/build.js",
+    "build:dir": "node scripts/build.js"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "SEE LICENSE IN LICENSE",
   "type": "commonjs",
   "devDependencies": {
+    "@electron/packager": "^20.0.0",
     "electron": "^42.2.0"
   },
   "dependencies": {

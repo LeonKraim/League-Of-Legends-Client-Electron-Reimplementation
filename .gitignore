@@ -13,3 +13,7 @@ settings.json
 # Environment files
 .env
 .env.local
+
+# Build output
+dist/
+
