@@ -1,5 +1,5 @@
 const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog } = require('electron');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, execFile } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
@@ -220,27 +220,19 @@ function quotePowerShellSingle(value) {
 }
 
 function startLeagueClient() {
+  // Use RiotClientServices with args to minimize Riot Client window
   if (cfg.riotClientServicesExe && fs.existsSync(cfg.riotClientServicesExe)) {
-    execFileSync('powershell.exe', [
+    execFile('powershell.exe', [
       '-NoProfile',
       '-Command',
-      "& '.\\RiotClientServices.exe' --launch-product=league_of_legends --launch-patchline=live"
-    ], {
-      encoding: 'utf8',
-      cwd: cfg.riotDir
+      "Start-Process -FilePath '.\\RiotClientServices.exe' -ArgumentList '--launch-product=league_of_legends','--launch-patchline=live' -WindowStyle Minimized"
+    ], { encoding: 'utf8', cwd: cfg.riotDir }, (error) => {
+      if (error && DEBUG) console.error(`[league:start] RiotClientServices error: ${error.message}`);
     });
     return;
   }
 
-  if (!cfg.leagueClientExe || !fs.existsSync(cfg.leagueClientExe)) {
-    throw new Error(`League client launch target not found. Checked: ${cfg.riotClientServicesExe} and ${cfg.leagueClientExe}`);
-  }
-
-  execFileSync('powershell.exe', [
-    '-NoProfile',
-    '-Command',
-    `Start-Process -FilePath '${cfg.leagueClientExe.replace(/'/g, "''")}' -WindowStyle Hidden`
-  ], { encoding: 'utf8' });
+  throw new Error(`RiotClientServices.exe not found at ${cfg.riotClientServicesExe}`);
 }
 
 function requestRiotClient(path, port, token, method = 'GET', body = null) {
@@ -433,6 +425,77 @@ async function suppressStockLeagueUxAfterLoad(league, options = {}) {
     console.error(`[league:kill-ux] ${lastError.message}`);
   }
   return false;
+}
+
+function hideRiotClientSplashWindowsOnce() {
+  // Uses async execFile so it NEVER blocks the Node.js event loop
+  const script = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class RiotSplashHider {
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc f, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
+  public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
+  public static int HideRiotWindows(uint[] riotPids) {
+    int count = 0;
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      uint procId = 0;
+      GetWindowThreadProcessId(h, out procId);
+      foreach (uint rp in riotPids) {
+        if (procId == rp) {
+          RECT rect;
+          GetWindowRect(h, out rect);
+          int w = rect.R - rect.L, hh = rect.B - rect.T;
+          if (w > 100 && hh > 100) {
+            ShowWindow(h, 6);
+            ShowWindow(h, 0);
+            count++;
+          }
+          break;
+        }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return count;
+  }
+}
+"@
+$riotPids = @(Get-Process | Where-Object { $_.Name -like '*Riot Client*' -or $_.Name -like 'LeagueClientUx*' } | Select-Object -ExpandProperty Id)
+if ($riotPids.Count -gt 0) {
+  $hidden = [RiotSplashHider]::HideRiotWindows([uint[]]$riotPids)
+  Write-Output $hidden
+} else {
+  Write-Output 0
+}
+`;
+  return new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8' }, (error, stdout) => {
+      if (error) {
+        if (DEBUG) console.error(`[riot:splash] ${error.message}`);
+        return resolve(0);
+      }
+      const count = parseInt((stdout || '').trim(), 10) || 0;
+      if (count > 0) console.log(`[riot:splash] hid ${count} Riot Client window(s)`);
+      resolve(count);
+    });
+  });
+}
+
+async function suppressRiotClientSplash(options = {}) {
+  const totalMs = options.totalMs || 20000;
+  const pollMs = options.pollMs || 2000;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < totalMs) {
+    await hideRiotClientSplashWindowsOnce();
+    await delay(pollMs);
+  }
 }
 
 async function requestLeagueServerShutdown(league) {
@@ -1613,11 +1676,12 @@ async function createWindow() {
 
   console.log(`[league] Loading bridge for ${baseUrl}/bootstrap.html`);
   await win.loadURL(`http://127.0.0.1:${bridge.port}/index.html`);
-  if (startup.startedByApp) {
-    suppressStockLeagueUxAfterLoad(league).catch((error) => {
-      console.error(`[league:kill-ux] ${error.message}`);
-    });
-  }
+  suppressStockLeagueUxAfterLoad(league).catch((error) => {
+    console.error(`[league:kill-ux] ${error.message}`);
+  });
+  suppressRiotClientSplash().catch((error) => {
+    console.error(`[riot:splash] ${error.message}`);
+  });
 }
 
 if (cfg.configError) {
@@ -1630,6 +1694,7 @@ app.whenReady().then(async () => {
     return;
   }
   await createWindow();
+
 }).catch((error) => {
   console.error(error);
   app.quit();

@@ -1,1 +1,12 @@
 (electron) 'console-message' arguments are deprecated and will be removed. Please use Event<WebContentsConsoleMessageEventParams> object instead.
+[main:uncaught] TypeError: First argument must be a valid error code number
+    at Sender.close (C:\Users\offle\Desktop\New folder (7)\node_modules\ws\lib\sender.js:190:13)
+    at WebSocket.close (C:\Users\offle\Desktop\New folder (7)\node_modules\ws\lib\websocket.js:322:18)
+    at WebSocket.<anonymous> (C:\Users\offle\Desktop\New folder (7)\main.js:1418:59)
+    at WebSocket.emit (node:events:509:28)
+    at WebSocket.emitClose (C:\Users\offle\Desktop\New folder (7)\node_modules\ws\lib\websocket.js:279:10)
+    at Receiver.receiverOnFinish (C:\Users\offle\Desktop\New folder (7)\node_modules\ws\lib\websocket.js:1228:20)
+    at Receiver.emit (node:events:509:28)
+    at finish (node:internal/streams/writable:953:10)
+    at node:internal/streams/writable:934:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)
