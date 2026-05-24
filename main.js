@@ -15,6 +15,19 @@ const LEAGUE_DIR = 'C:\\Riot Games\\League of Legends';
 const PLUGINS_DIR = path.join(LEAGUE_DIR, 'Plugins');
 const FRONTEND_PREFIX = 'rcp-fe-';
 const STATIC_PLUGIN = 'rcp-fe-lol-static-assets';
+const WINDOW_SIZES = [
+  { width: 1024, height: 576, scale: 0.8 },
+  { width: 1280, height: 720, scale: 1 },
+  { width: 1600, height: 900, scale: 1.25 }
+];
+
+process.on('uncaughtException', (error) => {
+  console.error(`[main:uncaught] ${error.stack || error.message}`);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error(`[main:unhandled] ${error && (error.stack || error.message) || error}`);
+});
 
 app.commandLine.appendSwitch('ignore-certificate-errors');
 app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling');
@@ -32,6 +45,34 @@ ipcMain.on('riot-invoke', (event, request) => {
   handleRiotInvoke(win, { request }).catch((error) => {
     console.error(`[riotInvoke] ${error.message}`);
   });
+});
+
+const windowDragState = new WeakMap();
+
+ipcMain.on('league-window-drag-start', (event, point) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || !point) return;
+
+  windowDragState.set(win, {
+    bounds: win.getBounds(),
+    screenX: Number(point.screenX),
+    screenY: Number(point.screenY)
+  });
+});
+
+ipcMain.on('league-window-drag-move', (event, point) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = win && windowDragState.get(win);
+  if (!win || !state || !point) return;
+
+  const x = Math.round(state.bounds.x + Number(point.screenX) - state.screenX);
+  const y = Math.round(state.bounds.y + Number(point.screenY) - state.screenY);
+  win.setPosition(x, y, false);
+});
+
+ipcMain.on('league-window-drag-end', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) windowDragState.delete(win);
 });
 
 function readLeagueUxArgs() {
@@ -136,7 +177,353 @@ function buildIndexHtml(league, bridgePort) {
       : `<link href='${href}' rel='stylesheet' data-plugin-name='${plugin.name}'>`)
     .join('');
 
-  return `<!doctype html><html><head>  <base href='/'>  <meta charset='utf-8'>  <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />  <link rel='riot:plugins:dependency-graph' href='/graph.json' />  <link rel='riot:plugins:websocket' href='ws://127.0.0.1:${bridgePort}/ws' />  ${cssHtml}  <script>window.getPluginAnnounceEventName = (pluginName) => \`riotPlugin.announce:\${pluginName}\`;</script>${scriptTags.join('')}</head><body data-env='public' data-loading-div-id='index_loading_div_20210908'>  <div id='index_loading_div_20210908' style='position: fixed;display: flex;align-items: center;justify-content: center;flex-direction: column;pointer-events: all;top: 0;left: 0;width: 100%;height: 100%;direction: ltr;'>    <img src='/lol-game-data/assets/ASSETS/SplashScreens/lol_icon.png'>  </div>  <script src='/fe/plugin-runner/rcp-fe-plugin-runner.js?t=${timestamp}'></script></body></html>`;
+  return `<!doctype html><html><head>  <base href='/'>  <meta charset='utf-8'>  <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />  <link rel='riot:plugins:dependency-graph' href='/graph.json' />  <link rel='riot:plugins:websocket' href='ws://127.0.0.1:${bridgePort}/ws' />  ${cssHtml}  <style>${electronDragCss()}</style>  <script>${electronDragScript()}</script>  <script>window.getPluginAnnounceEventName = (pluginName) => \`riotPlugin.announce:\${pluginName}\`;</script>${scriptTags.join('')}</head><body data-env='public' data-loading-div-id='index_loading_div_20210908'>  <div id='index_loading_div_20210908' style='position: fixed;display: flex;align-items: center;justify-content: center;flex-direction: column;pointer-events: all;top: 0;left: 0;width: 100%;height: 100%;direction: ltr;'>    <img src='/lol-game-data/assets/ASSETS/SplashScreens/lol_icon.png'>  </div>  <script src='/fe/plugin-runner/rcp-fe-plugin-runner.js?t=${timestamp}'></script></body></html>`;
+}
+
+function currentWindowScale(win) {
+  if (win.currentLeagueWindowSize) return win.currentLeagueWindowSize.scale;
+  const [width, height] = win.getContentSize();
+  const match = WINDOW_SIZES.find((size) => size.width === width && size.height === height);
+  return match ? match.scale : 1;
+}
+
+function windowSizeForScale(scale) {
+  const numericScale = Number(scale);
+  return WINDOW_SIZES.find((size) => Math.abs(size.scale - numericScale) < 0.001) || WINDOW_SIZES[1];
+}
+
+function windowSizeForDimensions(width, height) {
+  return WINDOW_SIZES.find((size) => size.width === width && size.height === height) || WINDOW_SIZES[1];
+}
+
+function riotResult(value) {
+  return JSON.stringify({ result: JSON.stringify(value) });
+}
+
+function applyWindowSize(win, size, center = false) {
+  win.setResizable(true);
+  win.setMinimumSize(0, 0);
+  win.setMaximumSize(9999, 9999);
+  win.webContents.setZoomFactor(size.scale);
+  win.setContentSize(size.width, size.height);
+  win.currentLeagueWindowSize = size;
+  win.webContents.executeJavaScript(
+    `if (window.__setLeagueElectronSize) {
+      window.__setLeagueElectronSize(${size.width}, ${size.height}, ${size.scale});
+      setTimeout(() => window.__setLeagueElectronSize(${size.width}, ${size.height}, ${size.scale}), 50);
+      setTimeout(() => window.__setLeagueElectronSize(${size.width}, ${size.height}, ${size.scale}), 250);
+    }`,
+    true
+  ).catch(() => {});
+  win.setResizable(false);
+  if (center) win.center();
+}
+
+async function applySavedWindowSize(win, league) {
+  const responses = await Promise.all([
+    requestLeague('/lol-settings/v1/local/video', league.port, league.token),
+    requestLeague('/lol-settings/v2/local/LCUPreferences/video', league.port, league.token)
+  ]);
+  const response = responses.find((candidate) => candidate.statusCode && candidate.statusCode < 400 && candidate.body) || responses[0];
+  const parsed = parseJsonBody(Buffer.from(response.body || ''));
+  const scale = parsed && (parsed.ZoomScale ?? parsed.data?.ZoomScale);
+  if (scale !== undefined) applyWindowSize(win, windowSizeForScale(scale), true);
+}
+
+function electronDragCss() {
+  return `
+    body,
+    body *,
+    button,
+    input,
+    select,
+    textarea,
+    a,
+    [role='button'],
+    [tabindex],
+    [onclick] {
+      -webkit-app-region: no-drag;
+    }
+
+    body,
+    body *:not(input):not(textarea) {
+      -webkit-user-drag: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    img,
+    svg,
+    canvas,
+    video {
+      -webkit-user-drag: none;
+      user-drag: none;
+    }
+
+    html,
+    body {
+      background: #010a13 !important;
+      height: 100% !important;
+      margin: 0 !important;
+      overflow: hidden !important;
+      transform: none !important;
+      width: 100% !important;
+    }
+
+    input,
+    textarea {
+      user-select: text;
+    }
+
+    rcp-fe-lol-navigation,
+    lol-uikit-navigation,
+    lol-navigation,
+    .rcp-fe-lol-navigation,
+    .lol-navigation,
+    .navigation,
+    .navigation-bar,
+    .nav-bar,
+    .top-nav,
+    .topbar,
+    .titlebar,
+    .title-bar,
+    .window-chrome,
+    .chrome,
+    header {
+      -webkit-app-region: no-drag;
+    }
+
+    [data-electron-no-drag],
+    [data-electron-no-drag] *,
+    .app-controls,
+    .app-controls *,
+    .app-controls-button,
+    .app-controls-button *,
+    .app-controls-support,
+    .app-controls-hide,
+    .app-controls-settings,
+    .app-controls-close,
+    .summoner,
+    .summoner *,
+    .currency,
+    .currency *,
+    .social,
+    .social *,
+    .parties,
+    .parties *,
+    .navigation-item,
+    .navigation-item *,
+    .nav-item,
+    .nav-item *,
+    .nav-button,
+    .nav-button * {
+      -webkit-app-region: no-drag;
+    }
+  `.replace(/\s+/g, ' ').trim();
+}
+
+function electronDragScript() {
+  return `
+    (() => {
+      window.alert = () => {};
+      window.confirm = () => false;
+      window.onerror = () => true;
+      window.onunhandledrejection = (event) => {
+        event.preventDefault();
+        return true;
+      };
+      window.addEventListener('error', (event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }, true);
+      window.addEventListener('unhandledrejection', (event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }, true);
+      document.addEventListener('dragstart', (event) => {
+        event.preventDefault();
+      }, true);
+      document.addEventListener('selectstart', (event) => {
+        const target = event.target;
+        if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
+        event.preventDefault();
+      }, true);
+      window.__setLeagueElectronSize = (width, height) => {
+        if (!document.body) return;
+        document.documentElement.style.setProperty('width', '100%', 'important');
+        document.documentElement.style.setProperty('height', '100%', 'important');
+        document.documentElement.style.setProperty('overflow', 'hidden', 'important');
+        document.body.style.setProperty('width', '100%', 'important');
+        document.body.style.setProperty('height', '100%', 'important');
+        document.body.style.setProperty('transform', 'none', 'important');
+        document.body.style.setProperty('transform-origin', 'top left', 'important');
+        document.body.style.setProperty('overflow', 'hidden', 'important');
+        window.dispatchEvent(new Event('resize'));
+      };
+      const allElements = (root = document) => {
+        const result = [];
+        const visit = (node) => {
+          if (!node) return;
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            result.push(node);
+            if (node.shadowRoot) visit(node.shadowRoot);
+          }
+          for (const child of node.children || []) visit(child);
+        };
+        visit(root);
+        return result;
+      };
+      const hideOpenPartyTooltip = () => {
+        const textMatches = [];
+        for (const element of allElements()) {
+          const text = (element.textContent || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+          if (/PARTY\\s+IS\\s+OPEN/.test(text) || /YOUR\\s+PARTY/.test(text)) textMatches.push(element);
+        }
+
+        for (const element of textMatches.reverse()) {
+          let node = element;
+          for (let i = 0; i < 10 && node && node !== document.body && node !== document.documentElement; i += 1) {
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            if (
+              rect.width >= 120 &&
+              rect.width <= 560 &&
+              rect.height >= 40 &&
+              rect.height <= 260 &&
+              style.position !== 'static'
+            ) {
+              node.style.display = 'none';
+              node.dataset.electronHiddenOpenPartyTooltip = 'true';
+              break;
+            }
+            node = node.parentElement || node.host;
+          }
+        }
+      };
+      if (document.body) window.__setLeagueElectronSize(window.innerWidth, window.innerHeight);
+      const dragSelectors = [
+        'rcp-fe-lol-navigation',
+        'lol-uikit-navigation',
+        'lol-navigation',
+        '.rcp-fe-lol-navigation',
+        '.lol-navigation',
+        '.navigation-bar',
+        '.nav-bar',
+        '.top-nav',
+        '.topbar',
+        '.titlebar',
+        '.title-bar',
+        '.window-chrome'
+      ];
+      const interactiveSelectors = [
+        'button',
+        'a',
+        'input',
+        'select',
+        'textarea',
+        '[role="button"]',
+        '[tabindex]',
+        '[onclick]',
+        '[action]',
+        '.app-controls',
+        '.app-controls-button',
+        '.app-controls-support',
+        '.app-controls-hide',
+        '.app-controls-settings',
+        '.app-controls-close',
+        '.summoner',
+        '.currency',
+        '.social',
+        '.parties',
+        '.navigation-item',
+        '.nav-item',
+        '.nav-button'
+      ];
+      const parentOf = (node) => node && (node.parentElement || (node.getRootNode && node.getRootNode().host));
+      const interactiveSelector = interactiveSelectors.join(',');
+      const isInteractiveTarget = (target) => {
+        let node = target;
+        for (let i = 0; i < 12 && node && node !== document.body && node !== document.documentElement; i += 1) {
+          if (node.nodeType !== Node.ELEMENT_NODE) {
+            node = parentOf(node);
+            continue;
+          }
+          if (node.dataset && node.dataset.electronNoDrag === 'true') return true;
+          if (node.matches && node.matches(interactiveSelector)) return true;
+          const style = getComputedStyle(node);
+          if (style.cursor === 'pointer') return true;
+          node = parentOf(node);
+        }
+        return false;
+      };
+      const canStartWindowDrag = (clientX, clientY, target) => {
+        if (clientY < 0 || clientY > 45) return false;
+        if (clientX < 0 || clientX > window.innerWidth - 420) return false;
+        if (isInteractiveTarget(target)) return false;
+        return true;
+      };
+      window.__leagueElectronCanDragPoint = (clientX, clientY) => {
+        return canStartWindowDrag(clientX, clientY, document.elementFromPoint(clientX, clientY));
+      };
+      let draggingWindow = false;
+      let activePointerId = null;
+      const endWindowDrag = () => {
+        if (!draggingWindow) return;
+        draggingWindow = false;
+        activePointerId = null;
+        if (window.__leagueElectronDrag) window.__leagueElectronDrag.end();
+      };
+      document.addEventListener('pointerdown', (event) => {
+        if (event.button !== 0 || !canStartWindowDrag(event.clientX, event.clientY, event.target)) return;
+        draggingWindow = true;
+        activePointerId = event.pointerId;
+        if (event.target && event.target.setPointerCapture) {
+          try { event.target.setPointerCapture(event.pointerId); } catch (_error) {}
+        }
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (window.__leagueElectronDrag) window.__leagueElectronDrag.start(event.screenX, event.screenY);
+      }, true);
+      window.addEventListener('pointermove', (event) => {
+        if (!draggingWindow || (activePointerId !== null && event.pointerId !== activePointerId)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (window.__leagueElectronDrag) window.__leagueElectronDrag.move(event.screenX, event.screenY);
+      }, true);
+      window.addEventListener('pointerup', endWindowDrag, true);
+      window.addEventListener('pointercancel', endWindowDrag, true);
+      window.addEventListener('blur', endWindowDrag, true);
+      let queued = false;
+      const markChrome = () => {
+        queued = false;
+        for (const selector of dragSelectors) {
+          for (const element of document.querySelectorAll(selector)) {
+            for (const child of element.querySelectorAll(interactiveSelector)) {
+              child.dataset.electronNoDrag = 'true';
+            }
+            for (const child of element.querySelectorAll('*')) {
+              const style = getComputedStyle(child);
+              if (style.cursor === 'pointer') child.dataset.electronNoDrag = 'true';
+            }
+          }
+        }
+      };
+      const scheduleMarkChrome = () => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(markChrome);
+      };
+      window.addEventListener('DOMContentLoaded', () => {
+        window.__setLeagueElectronSize(window.innerWidth, window.innerHeight);
+        hideOpenPartyTooltip();
+        scheduleMarkChrome();
+        new MutationObserver(() => {
+          hideOpenPartyTooltip();
+          scheduleMarkChrome();
+        }).observe(document.body, { childList: true, subtree: true, characterData: true });
+      });
+    })();
+  `.replace(/\s+/g, ' ').trim();
 }
 
 const assetCache = new Map();
@@ -231,25 +618,86 @@ async function handleRiotInvoke(win, payload) {
   const params = Array.isArray(request.params) ? request.params : [];
   switch (request.name) {
     case 'Window.Close':
+    case 'Window.Exit':
+    case 'Window.Quit':
+    case 'Client.Exit':
+    case 'Client.Quit':
+    case 'RiotClient.Exit':
+    case 'RiotClient.Quit':
       win.close();
       return undefined;
     case 'Window.Minimize':
       win.minimize();
       return undefined;
+    case 'Window.Restore':
+    case 'Window.Activate':
+      win.restore();
+      win.focus();
+      return undefined;
     case 'Window.Show':
       win.show();
       return undefined;
-    case 'Window.ResizeTo':
-      if (params.length >= 2) win.setSize(Number(params[0]), Number(params[1]));
+    case 'Window.Hide':
+      win.hide();
       return undefined;
+    case 'Window.ResizeTo':
+      if (params.length >= 2) applyWindowSize(win, windowSizeForDimensions(Number(params[0]), Number(params[1])));
+      return undefined;
+    case 'Window.MoveTo':
+      if (params.length >= 2) win.setPosition(Number(params[0]), Number(params[1]));
+      return undefined;
+    case 'Window.GetValidWindowSizes':
+      return riotResult(WINDOW_SIZES.map((size) => ({
+        ...size,
+        selected: size.scale === currentWindowScale(win)
+      })));
+    case 'Window.ScreenData': {
+      const bounds = win.getBounds();
+      const display = require('electron').screen.getDisplayMatching(bounds);
+      return riotResult({
+        screenX: bounds.x,
+        screenY: bounds.y,
+        screenWidth: display.bounds.width,
+        screenHeight: display.bounds.height,
+        screenAvailWidth: display.workArea.width,
+        screenAvailHeight: display.workArea.height,
+        screenAvailLeft: display.workArea.x,
+        screenAvailTop: display.workArea.y,
+        windowWidth: bounds.width,
+        windowHeight: bounds.height,
+        windowActivated: win.isFocused(),
+        windowMinimized: win.isMinimized(),
+        zoomScale: currentWindowScale(win)
+      });
+    }
     case 'Window.CenterToScreen':
+    case 'Window.CenterWithinMainWindow':
+    case 'Window.CenterWithinParent':
       win.center();
+      return undefined;
+    case 'Window.SetTitle':
+      if (typeof params[0] === 'string') win.setTitle(params[0]);
+      return undefined;
+    case 'Window.Flash':
+      win.flashFrame(true);
+      return undefined;
+    case 'Mouse.SetDragBarHeight':
+      return undefined;
+    case 'Client.Logout':
+    case 'Client.SignOut':
+    case 'Auth.Logout':
+    case 'Auth.SignOut':
+    case 'RiotClient.SignOut':
+    case 'RiotClient.Logout':
+      await requestLeague('/lol-login/v1/session', win.league.port, win.league.token, 'DELETE');
+      win.close();
       return undefined;
     case 'Browser.OpenExternal':
     case 'Window.OpenExternal':
       if (typeof params[0] === 'string') await shell.openExternal(params[0]);
       return undefined;
     default:
+      if (DEBUG) console.log(`[riotInvoke:unhandled] ${request.name} ${JSON.stringify(params).slice(0, 500)}`);
       return undefined;
   }
 }
@@ -289,6 +737,72 @@ function sendBuffer(req, res, asset) {
 }
 
 function proxyLeague(req, res, league) {
+  const bodyChunks = [];
+  req.on('data', (chunk) => bodyChunks.push(chunk));
+  req.on('end', () => {
+    const body = Buffer.concat(bodyChunks);
+    const handled = handleLocalBridgeRoute(req, res, league, body);
+    if (handled) return;
+
+    forwardLeagueRequest(req, res, league, body);
+  });
+}
+
+function handleLocalBridgeRoute(req, res, league, body) {
+  const requestUrl = new URL(req.url, 'http://127.0.0.1');
+
+  if (requestUrl.pathname === '/lol-platform-config/v1/namespaces/LcuUxSettings') {
+    return sendJson(res, {
+      WindowSizeDefault: 1,
+      WindowSizeOptions: WINDOW_SIZES.map(({ width, height, scale }) => ({ width, height, scale }))
+    });
+  }
+
+  if (/^\/lol-settings\/v\d+\/(?:account|local)\/(?:LCUPreferences\/)?lol-parties$/.test(requestUrl.pathname)) {
+    return sendJson(res, {
+      data: {
+        hasSeenOpenPartyFirstExperience: true,
+        hasSeenOpenPartyTooltip: true,
+        hasSeenPartyOpenTooltip: true,
+        showOpenPartyTooltip: false
+      },
+      schemaVersion: 1
+    });
+  }
+
+  if (/^\/lol-lobby\/v2\/notifications\/[^/]+$/.test(requestUrl.pathname) && req.method === 'DELETE') {
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  if (/^\/lol-settings\/v\d+\/local\/(?:LCUPreferences\/)?video$/.test(requestUrl.pathname) && ['POST', 'PUT', 'PATCH'].includes(req.method)) {
+    const parsed = parseJsonBody(body);
+    const scale = parsed && (parsed.ZoomScale ?? parsed.data?.ZoomScale);
+    if (scale !== undefined && BrowserWindow.getAllWindows()[0]) {
+      applyWindowSize(BrowserWindow.getAllWindows()[0], windowSizeForScale(scale), true);
+    }
+  }
+
+  return false;
+}
+
+function sendJson(res, value, statusCode = 200) {
+  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' });
+  res.end(JSON.stringify(value));
+  return true;
+}
+
+function parseJsonBody(body) {
+  if (!body || !body.length) return null;
+  try {
+    return JSON.parse(body.toString('utf8'));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function forwardLeagueRequest(req, res, league, body) {
   const proxyReq = https.request({
     hostname: '127.0.0.1',
     port: league.port,
@@ -299,7 +813,8 @@ function proxyLeague(req, res, league) {
     headers: {
       ...req.headers,
       host: `127.0.0.1:${league.port}`,
-      authorization: `Basic ${Buffer.from(`riot:${league.token}`).toString('base64')}`
+      authorization: `Basic ${Buffer.from(`riot:${league.token}`).toString('base64')}`,
+      ...(body.length ? { 'content-length': body.length } : {})
     }
   }, (proxyRes) => {
     res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
@@ -307,11 +822,16 @@ function proxyLeague(req, res, league) {
   });
 
   proxyReq.on('error', (error) => {
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
     res.writeHead(502, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: error.message }));
   });
 
-  req.pipe(proxyReq);
+  if (body.length) proxyReq.write(body);
+  proxyReq.end();
 }
 
 function startBridgeServer(league) {
@@ -396,18 +916,23 @@ function startBridgeServer(league) {
   });
 }
 
-function requestLeague(path, port, token) {
+function requestLeague(path, port, token, method = 'GET', body = null) {
   return new Promise((resolve) => {
+    const payload = body ? Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)) : null;
     const req = https.request({
       hostname: '127.0.0.1',
       port,
       path,
-      method: 'GET',
+      method,
       rejectUnauthorized: false,
       auth: `riot:${token}`,
       headers: {
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'User-Agent': LEAGUE_UA
+        'User-Agent': LEAGUE_UA,
+        ...(payload ? {
+          'content-type': 'application/json',
+          'content-length': payload.length
+        } : {})
       }
     }, (res) => {
       let body = '';
@@ -417,6 +942,7 @@ function requestLeague(path, port, token) {
     });
 
     req.on('error', (error) => resolve({ path, error }));
+    if (payload) req.write(payload);
     req.end();
   });
 }
@@ -439,12 +965,15 @@ async function createWindow() {
   }
 
   const win = new BrowserWindow({
-    width: 1280,
-    height: 720,
+    width: WINDOW_SIZES[1].width,
+    height: WINDOW_SIZES[1].height,
     title: 'League Electron Client',
     backgroundColor: '#000000',
     autoHideMenuBar: true,
     frame: false,
+    thickFrame: false,
+    resizable: false,
+    useContentSize: true,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: false,
@@ -452,6 +981,11 @@ async function createWindow() {
       webSecurity: false,
       preload: path.join(__dirname, 'preload.js')
     }
+  });
+  win.league = league;
+  applyWindowSize(win, WINDOW_SIZES[1], true);
+  await applySavedWindowSize(win, league).catch((error) => {
+    if (DEBUG) console.log(`[settings] could not apply saved window size: ${error.message}`);
   });
 
   session.defaultSession.setUserAgent(LEAGUE_UA);
@@ -489,29 +1023,65 @@ async function createWindow() {
     }
   });
 
+  win.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'F12') {
+      event.preventDefault();
+      win.webContents.toggleDevTools();
+    }
+  });
+
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error(`[electron] render-process-gone ${details.reason}`);
+  });
+
+  win.webContents.on('unresponsive', () => {
+    console.error('[electron] renderer unresponsive');
+  });
+
   win.webContents.on('did-finish-load', async () => {
     const location = await win.webContents.executeJavaScript('location.href').catch(() => '');
     console.log(`[electron] loaded ${location}`);
+    await applySavedWindowSize(win, league).catch((error) => {
+      if (DEBUG) console.log(`[settings] could not reapply saved window size: ${error.message}`);
+    });
     if (!DEBUG) return;
 
-    setTimeout(async () => {
+    const captureDebugState = async (label) => {
       const image = await win.capturePage().catch(() => null);
       if (image) {
-        const screenshotPath = path.join(__dirname, 'league-electron-screenshot.png');
+        const screenshotPath = path.join(__dirname, `league-electron-screenshot-${label}.png`);
         fs.writeFileSync(screenshotPath, image.toPNG());
         console.log(`[electron] screenshot ${screenshotPath}`);
       }
       const state = await win.webContents.executeJavaScript(`({
         href: location.href,
         title: document.title,
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        bodyWidth: document.body && document.body.getBoundingClientRect().width,
+        bodyHeight: document.body && document.body.getBoundingClientRect().height,
+        bodyTransform: document.body && getComputedStyle(document.body).transform,
+        manualDragAt100x10: window.__leagueElectronCanDragPoint && window.__leagueElectronCanDragPoint(100, 10),
+        manualDragAt500x10: window.__leagueElectronCanDragPoint && window.__leagueElectronCanDragPoint(500, 10),
+        manualDragAtRightControls: window.__leagueElectronCanDragPoint && window.__leagueElectronCanDragPoint(window.innerWidth - 80, 10),
+        dragElementTag: document.elementFromPoint(100, 10) && document.elementFromPoint(100, 10).tagName,
+        dragElementRegion: document.elementFromPoint(100, 10) && getComputedStyle(document.elementFromPoint(100, 10)).webkitAppRegion,
+        partyTooltipTextPresent: document.body.innerText.toUpperCase().includes('PARTY IS OPEN'),
         scripts: document.scripts.length,
         loadingExists: !!document.getElementById('index_loading_div_20210908'),
         bodyText: document.body.innerText.slice(0, 500),
         riotPluginLoadTimes: window._riotPluginLoadTimes,
         keys: Object.keys(window).filter(k => k.startsWith('riot') || k.startsWith('Riot')).slice(0, 50)
       })`).catch((error) => ({ error: error.message }));
-      console.log(`[electron] state ${JSON.stringify(state).slice(0, 2000)}`);
-    }, 10000);
+      console.log(`[electron] state:${label} ${JSON.stringify({
+        ...state,
+        contentSize: win.getContentSize(),
+        bounds: win.getBounds(),
+        zoomFactor: win.webContents.getZoomFactor()
+      }).slice(0, 2000)}`);
+    };
+    setTimeout(() => captureDebugState('10s'), 10000);
+    setTimeout(() => captureDebugState('25s'), 25000);
   });
 
   console.log(`[league] Loading bridge for ${baseUrl}/bootstrap.html`);
