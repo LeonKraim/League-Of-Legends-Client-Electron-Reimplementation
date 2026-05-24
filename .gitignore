@@ -1,0 +1,15 @@
+node_modules/
+
+# Screenshots
+*.png
+
+# Logs
+*.log
+*.err
+
+# User configuration (contains local machine paths)
+settings.json
+
+# Environment files
+.env
+.env.local
