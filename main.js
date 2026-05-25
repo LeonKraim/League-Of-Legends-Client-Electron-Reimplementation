@@ -6,6 +6,7 @@ const https = require('node:https');
 const path = require('node:path');
 const WebSocket = require('ws');
 const { extractWAD } = require('@lol-archiver/lol-wad-extract');
+const { applyPatches, patchHtml } = require('./scripts/fe-patcher');
 
 process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
 
@@ -14,6 +15,7 @@ const DEBUG = process.env.DEBUG_LEAGUE_ELECTRON === '1';
 const LEAGUE_UA = 'Mozilla/5.0 LeagueOfLegendsClient/16.10.777.2413 (CEF 108)';
 const FRONTEND_PREFIX = 'rcp-fe-';
 const STATIC_PLUGIN = 'rcp-fe-lol-static-assets';
+const PATCHES_DIR = path.join(__dirname, 'patches');
 const LEAGUE_START_TIMEOUT_MS = 120000;
 const LEAGUE_START_POLL_MS = 1000;
 const LEAGUE_READY_TIMEOUT_MS = 120000;
@@ -419,24 +421,132 @@ async function suppressStockLeagueUxAfterLoad(league, options = {}) {
   }
 }
 
-const RIOT_BLOCKER_SCRIPT = Buffer.from('QWRkLVR5cGUgQCIKdXNpbmcgU3lzdGVtOwp1c2luZyBTeXN0ZW0uUnVudGltZS5JbnRlcm9wU2VydmljZXM7CnVzaW5nIFN5c3RlbS5EaWFnbm9zdGljczsKdXNpbmcgU3lzdGVtLkxpbnE7CnB1YmxpYyBjbGFzcyBSaW90QmxvY2tlciB7CiAgW0RsbEltcG9ydCgidXNlcjMyLmRsbCIpXSBwdWJsaWMgc3RhdGljIGV4dGVybiBJbnRQdHIgU2V0V2luRXZlbnRIb29rKHVpbnQgZU1pbiwgdWludCBlTWF4LCBJbnRQdHIgaG1vZCwgV2luRXZlbnREZWxlZ2F0ZSBkLCB1aW50IHBpZCwgdWludCB0aWQsIHVpbnQgZmxhZ3MpOwogIFtEbGxJbXBvcnQoInVzZXIzMi5kbGwiKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBVbmhvb2tXaW5FdmVudChJbnRQdHIgaGhrKTsKICBbRGxsSW1wb3J0KCJ1c2VyMzIuZGxsIildIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIHVpbnQgR2V0V2luZG93VGhyZWFkUHJvY2Vzc0lkKEludFB0ciBoLCBvdXQgdWludCBwKTsKICBbRGxsSW1wb3J0KCJ1c2VyMzIuZGxsIildIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGJvb2wgU2hvd1dpbmRvdyhJbnRQdHIgaCwgaW50IG4pOwogIFtEbGxJbXBvcnQoInVzZXIzMi5kbGwiKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBJc1dpbmRvd1Zpc2libGUoSW50UHRyIGgpOwogIFtEbGxJbXBvcnQoInVzZXIzMi5kbGwiKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBFbnVtV2luZG93cyhFbnVtV2luZG93c1Byb2MgZiwgSW50UHRyIGwpOwogIFtEbGxJbXBvcnQoInVzZXIzMi5kbGwiKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBHZXRXaW5kb3dSZWN0KEludFB0ciBoLCBvdXQgUkVDVCByKTsKICBbRGxsSW1wb3J0KCJ1c2VyMzIuZGxsIildIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGJvb2wgUG9zdE1lc3NhZ2UoSW50UHRyIGgsIHVpbnQgbSwgSW50UHRyIHcsIEludFB0ciBsKTsKICBbRGxsSW1wb3J0KCJ1c2VyMzIuZGxsIildIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGludCBNc2dXYWl0Rm9yTXVsdGlwbGVPYmplY3RzKGludCBuLCBJbnRQdHIgcCwgYm9vbCBmV2FpdCwgaW50IG1zLCB1aW50IG1hc2spOwogIFtEbGxJbXBvcnQoInVzZXIzMi5kbGwiKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBQZWVrTWVzc2FnZShvdXQgTVNHIG0sIEludFB0ciBoLCB1aW50IG1pbiwgdWludCBtYXgsIHVpbnQgZik7CiAgW0RsbEltcG9ydCgidXNlcjMyLmRsbCIpXSBwdWJsaWMgc3RhdGljIGV4dGVybiBib29sIFRyYW5zbGF0ZU1lc3NhZ2UocmVmIE1TRyBtKTsKICBbRGxsSW1wb3J0KCJ1c2VyMzIuZGxsIildIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGJvb2wgRGlzcGF0Y2hNZXNzYWdlKHJlZiBNU0cgbSk7CiAgW1N0cnVjdExheW91dChMYXlvdXRLaW5kLlNlcXVlbnRpYWwpXSBwdWJsaWMgc3RydWN0IE1TRyB7IHB1YmxpYyBJbnRQdHIgaHduZDsgcHVibGljIHVpbnQgbWVzc2FnZTsgcHVibGljIEludFB0ciB3UGFyYW07IHB1YmxpYyBJbnRQdHIgbFBhcmFtOyBwdWJsaWMgdWludCB0aW1lOyBwdWJsaWMgaW50IHg7IHB1YmxpYyBpbnQgeTsgfQogIFtTdHJ1Y3RMYXlvdXQoTGF5b3V0S2luZC5TZXF1ZW50aWFsKV0gcHVibGljIHN0cnVjdCBSRUNUIHsgcHVibGljIGludCBMLFQsUixCOyB9CiAgcHVibGljIGRlbGVnYXRlIGJvb2wgRW51bVdpbmRvd3NQcm9jKEludFB0ciBoLCBJbnRQdHIgbCk7CiAgcHVibGljIGRlbGVnYXRlIHZvaWQgV2luRXZlbnREZWxlZ2F0ZShJbnRQdHIgaEhvb2ssIHVpbnQgZSwgSW50UHRyIGh3bmQsIGludCBpZE9iaiwgaW50IGlkQ2hpbGQsIHVpbnQgZVRocmVhZCwgdWludCBlVGltZSk7CiAgY29uc3QgdWludCBFVkVOVF9PQkpFQ1RfU0hPVyA9IDB4ODAwMjsKICBjb25zdCB1aW50IFdJTkVWRU5UX09VVE9GQ09OVEVYVCA9IDA7CiAgY29uc3QgdWludCBRU19BTExJTlBVVCA9IDB4RkY7CiAgY29uc3QgdWludCBXTV9TWVNDT01NQU5EID0gMHgwMTEyOwogIGNvbnN0IHVpbnQgU0NfTUlOSU1JWkUgPSAweEYwMjA7CgogIHByaXZhdGUgc3RhdGljIFdpbkV2ZW50RGVsZWdhdGUgX2RlbDsKICBwcml2YXRlIHN0YXRpYyBJbnRQdHIgX2hvb2s7CiAgcHJpdmF0ZSBzdGF0aWMgdWludFtdIF9waWRzID0gbmV3IHVpbnRbMF07CgogIHB1YmxpYyBzdGF0aWMgdm9pZCBSdW5Gb3JldmVyKCkgewogICAgX2RlbCA9IE9uRXZlbnQ7CiAgICBfaG9vayA9IFNldFdpbkV2ZW50SG9vayhFVkVOVF9PQkpFQ1RfU0hPVywgRVZFTlRfT0JKRUNUX1NIT1csIEludFB0ci5aZXJvLCBfZGVsLCAwLCAwLCBXSU5FVkVOVF9PVVRPRkNPTlRFWFQpOwogICAgaW50IGxhc3RQaWRTY2FuID0gMDsKICAgIE1TRyBtc2c7CiAgICB3aGlsZSAodHJ1ZSkgewogICAgICB3aGlsZSAoUGVla01lc3NhZ2Uob3V0IG1zZywgSW50UHRyLlplcm8sIDAsIDAsIDEpKSB7CiAgICAgICAgaWYgKG1zZy5tZXNzYWdlID09IDB4MTIpIHsgVW5ob29rV2luRXZlbnQoX2hvb2spOyByZXR1cm47IH0KICAgICAgICBUcmFuc2xhdGVNZXNzYWdlKHJlZiBtc2cpOwogICAgICAgIERpc3BhdGNoTWVzc2FnZShyZWYgbXNnKTsKICAgICAgfQogICAgICBpbnQgbm93ID0gRW52aXJvbm1lbnQuVGlja0NvdW50OwogICAgICBpZiAobm93IC0gbGFzdFBpZFNjYW4gPiA1MDApIHsKICAgICAgICBsYXN0UGlkU2NhbiA9IG5vdzsKICAgICAgICB0cnkgewogICAgICAgICAgX3BpZHMgPSBQcm9jZXNzLkdldFByb2Nlc3Nlc0J5TmFtZSgiUmlvdCBDbGllbnQiKS5TZWxlY3QocCA9PiAodWludClwLklkKS5Ub0FycmF5KCk7CiAgICAgICAgICBpZiAoX3BpZHMuTGVuZ3RoID4gMCkgSGlkZUV4aXN0aW5nKF9waWRzKTsKICAgICAgICB9IGNhdGNoIHsgX3BpZHMgPSBuZXcgdWludFswXTsgfQogICAgICB9CiAgICAgIE1zZ1dhaXRGb3JNdWx0aXBsZU9iamVjdHMoMCwgSW50UHRyLlplcm8sIGZhbHNlLCA1MDAsIFFTX0FMTElOUFVUKTsKICAgIH0KICB9CgogIHByaXZhdGUgc3RhdGljIHZvaWQgT25FdmVudChJbnRQdHIgaEhvb2ssIHVpbnQgZSwgSW50UHRyIGh3bmQsIGludCBpZE9iaiwgaW50IGlkQ2hpbGQsIHVpbnQgZVRocmVhZCwgdWludCBlVGltZSkgewogICAgaWYgKGlkT2JqICE9IDAgfHwgaHduZCA9PSBJbnRQdHIuWmVybyB8fCBfcGlkcy5MZW5ndGggPT0gMCkgcmV0dXJuOwogICAgdWludCBwaWQgPSAwOwogICAgR2V0V2luZG93VGhyZWFkUHJvY2Vzc0lkKGh3bmQsIG91dCBwaWQpOwogICAgZm9yZWFjaCAodWludCB0cCBpbiBfcGlkcykgewogICAgICBpZiAocGlkID09IHRwKSB7CiAgICAgICAgU2hvd1dpbmRvdyhod25kLCA2KTsKICAgICAgICBQb3N0TWVzc2FnZShod25kLCBXTV9TWVNDT01NQU5ELCAoSW50UHRyKVNDX01JTklNSUNFLCBJbnRQdHIuWmVybyk7CiAgICAgICAgU2hvd1dpbmRvdyhod25kLCAwKTsKICAgICAgICBicmVhazsKICAgICAgfQogICAgfQogIH0KCiAgcHJpdmF0ZSBzdGF0aWMgdm9pZCBIaWRlRXhpc3RpbmcodWludFtdIHBpZHMpIHsKICAgIEVudW1XaW5kb3dzKChoLCBsKSA9PiB7CiAgICAgIGlmICghSXNXaW5kb3dWaXNpYmxlKGgpKSByZXR1cm4gdHJ1ZTsKICAgICAgdWludCBwaWQgPSAwOwogICAgICBHZXRXaW5kb3dUaHJlYWRQcm9jZXNzSWQoaCwgb3V0IHBpZCk7CiAgICAgIGZvcmVhY2ggKHVpbnQgcnAgaW4gcGlkcykgewogICAgICAgIGlmIChwaWQgPT0gcnApIHsKICAgICAgICAgIFJFQ1QgcjsgR2V0V2luZG93UmVjdChoLCBvdXQgcik7CiAgICAgICAgICBpZiAoKHIuUiAtIHIuTCkgPiAxMDAgJiYgKHIuQiAtIHIuVCkgPiAxMDApIHsKICAgICAgICAgICAgU2hvd1dpbmRvdyhoLCA2KTsgUG9zdE1lc3NhZ2UoaCwgV01fU1lTQ09NTUFORCwgKEludFB0cilTQ19NSU5JTUlaRSwgSW50UHRyLlplcm8pOyBTaG93V2luZG93KGgsIDApOwogICAgICAgICAgfQogICAgICAgICAgYnJlYWs7CiAgICAgICAgfQogICAgICB9CiAgICAgIHJldHVybiB0cnVlOwogICAgfSwgSW50UHRyLlplcm8pOwogIH0KfQoiQApbUmlvdEJsb2NrZXJdOjpSdW5Gb3JldmVyKCk=', 'base64');
 
 let riotTrayMinimizerProcess = null;
 
 function startRiotClientTrayMinimizer() {
-  // Spawns a persistent PowerShell process with a C# native message pump.
-  // SetWinEventHook catches Riot Client window show events and hides them
-  // instantly via the message pump — zero CPU, zero visible flash.
+  // Writes the C#/PowerShell blocker script to a temp file and spawns it.
+  // SetWinEventHook catches Riot Client windows at creation
+  // (EVENT_OBJECT_CREATE), makes them 100% transparent (WS_EX_LAYERED
+  // with 0 opacity), then hides them when shown (EVENT_OBJECT_SHOW) —
+  // the window is never visible to the user.
+  const os = require('node:os');
+  const tmpFile = path.join(os.tmpdir(), 'rcb-' + process.pid + '.ps1');
+  const script = `Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+using System.Linq;
+public class RiotBlocker {
+  [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint eMin, uint eMax, IntPtr hmod, WinEventDelegate d, uint pid, uint tid, uint flags);
+  [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hhk);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc f, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern int MsgWaitForMultipleObjects(int n, IntPtr p, bool fWait, int ms, uint mask);
+  [DllImport("user32.dll")] public static extern bool PeekMessage(out MSG m, IntPtr h, uint min, uint max, uint f);
+  [DllImport("user32.dll")] public static extern bool TranslateMessage(ref MSG m);
+  [DllImport("user32.dll")] public static extern bool DispatchMessage(ref MSG m);
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int n, int v);
+  [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint c, byte a, uint f);
+  [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; }
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
+  public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
+  public delegate void WinEventDelegate(IntPtr hHook, uint e, IntPtr hwnd, int idObj, int idChild, uint eThread, uint eTime);
+  const uint EVENT_OBJECT_CREATE = 0x8000;
+  const uint EVENT_OBJECT_SHOW = 0x8002;
+  const uint WINEVENT_OUTOFCONTEXT = 0;
+  const uint QS_ALLINPUT = 0xFF;
+  const uint WM_SYSCOMMAND = 0x0112;
+  const uint SC_MINIMIZE = 0xF020;
+  const int GWL_EXSTYLE = -20;
+  const int WS_EX_LAYERED = 0x80000;
+  const uint LWA_ALPHA = 0x2;
+
+  private static WinEventDelegate _del;
+  private static IntPtr _hook;
+  private static uint[] _pids = new uint[0];
+
+  public static void RunForever() {
+    _del = OnEvent;
+    _hook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, IntPtr.Zero, _del, 0, 0, WINEVENT_OUTOFCONTEXT);
+    int lastPidScan = 0;
+    MSG msg;
+    while (true) {
+      while (PeekMessage(out msg, IntPtr.Zero, 0, 0, 1)) {
+        if (msg.message == 0x12) { UnhookWinEvent(_hook); return; }
+        TranslateMessage(ref msg);
+        DispatchMessage(ref msg);
+      }
+      int now = Environment.TickCount;
+      if (now - lastPidScan > 500) {
+        lastPidScan = now;
+        try {
+          _pids = Process.GetProcessesByName("Riot Client").Select(p => (uint)p.Id).ToArray();
+          if (_pids.Length > 0) HideExisting(_pids);
+        } catch { _pids = new uint[0]; }
+      }
+      MsgWaitForMultipleObjects(0, IntPtr.Zero, false, 500, QS_ALLINPUT);
+    }
+  }
+
+  private static void OnEvent(IntPtr hHook, uint e, IntPtr hwnd, int idObj, int idChild, uint eThread, uint eTime) {
+    if (idObj != 0 || hwnd == IntPtr.Zero || _pids.Length == 0) return;
+    uint pid = 0;
+    GetWindowThreadProcessId(hwnd, out pid);
+    foreach (uint tp in _pids) {
+      if (pid == tp) {
+        if (e == EVENT_OBJECT_CREATE) {
+          int ex = GetWindowLong(hwnd, GWL_EXSTYLE);
+          SetWindowLong(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+          SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+        } else if (e == EVENT_OBJECT_SHOW) {
+          ShowWindow(hwnd, 6);
+          PostMessage(hwnd, WM_SYSCOMMAND, (IntPtr)SC_MINIMIZE, IntPtr.Zero);
+          ShowWindow(hwnd, 0);
+        }
+        break;
+      }
+    }
+  }
+
+  private static void HideExisting(uint[] pids) {
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      uint pid = 0;
+      GetWindowThreadProcessId(h, out pid);
+      foreach (uint rp in pids) {
+        if (pid == rp) {
+          RECT r; GetWindowRect(h, out r);
+          if ((r.R - r.L) > 100 && (r.B - r.T) > 100) {
+            ShowWindow(h, 6); PostMessage(h, WM_SYSCOMMAND, (IntPtr)SC_MINIMIZE, IntPtr.Zero); ShowWindow(h, 0);
+          }
+          break;
+        }
+      }
+      return true;
+    }, IntPtr.Zero);
+  }
+}
+"@
+[RiotBlocker]::RunForever()
+`;
   try {
-    riotTrayMinimizerProcess = execFile('powershell.exe', [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass',
-      '-Command', `[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${RIOT_BLOCKER_SCRIPT}')) | iex`
-    ], { encoding: 'utf8' }, (error) => {
-      if (error && DEBUG) console.error(`[riot:tray] minimizer exited: ${error.message}`);
+    fs.writeFileSync(tmpFile, script, 'utf8');
+    riotTrayMinimizerProcess = require('node:child_process').spawn('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tmpFile
+    ], { stdio: 'ignore' });
+    riotTrayMinimizerProcess.on('exit', () => {
+      try { fs.unlinkSync(tmpFile); } catch (_error) {}
     });
-    if (DEBUG) console.log('[riot:tray] blocker script started');
+    if (DEBUG) console.log('[riot:tray] blocker started');
   } catch (error) {
-    if (DEBUG) console.error(`[riot:tray] failed to start minimizer: ${error.message}`);
+    if (DEBUG) console.error(`[riot:tray] failed to start: ${error.message}`);
+    try { fs.unlinkSync(tmpFile); } catch (_error) {}
   }
 }
 
@@ -711,7 +821,7 @@ function buildIndexHtml(league, bridgePort) {
       : `<link href='${href}' rel='stylesheet' data-plugin-name='${plugin.name}'>`)
     .join('');
 
-  return `<!doctype html><html><head>  <base href='/'>  <meta charset='utf-8'>  <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />  <link rel='riot:plugins:dependency-graph' href='/graph.json' />  <link rel='riot:plugins:websocket' href='ws://127.0.0.1:${bridgePort}/ws' />  ${cssHtml}  <style>${electronDragCss()}</style>  <script>${electronDragScript()}</script>  <script>window.getPluginAnnounceEventName = (pluginName) => \`riotPlugin.announce:\${pluginName}\`;</script>${scriptTags.join('')}</head><body data-env='public' data-loading-div-id='index_loading_div_20210908'>  <div id='index_loading_div_20210908' style='position: fixed;display: flex;align-items: center;justify-content: center;flex-direction: column;pointer-events: all;top: 0;left: 0;width: 100%;height: 100%;direction: ltr;'>    <img src='/lol-game-data/assets/ASSETS/SplashScreens/lol_icon.png'>  </div>  <script src='/fe/plugin-runner/rcp-fe-plugin-runner.js?t=${timestamp}'></script></body></html>`;
+  return patchHtml(`<!doctype html><html><head>  <base href='/'>  <meta charset='utf-8'>  <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />  <link rel='riot:plugins:dependency-graph' href='/graph.json' />  <link rel='riot:plugins:websocket' href='ws://127.0.0.1:${bridgePort}/ws' />  ${cssHtml}  <style>${electronDragCss()}</style>  <script>${electronDragScript()}</script>  <script>window.getPluginAnnounceEventName = (pluginName) => \`riotPlugin.announce:\${pluginName}\`;</script>${scriptTags.join('')}</head><body data-env='public' data-loading-div-id='index_loading_div_20210908'>  <div id='index_loading_div_20210908' style='position: fixed;display: flex;align-items: center;justify-content: center;flex-direction: column;pointer-events: all;top: 0;left: 0;width: 100%;height: 100%;direction: ltr;'>    <img src='/lol-game-data/assets/ASSETS/SplashScreens/lol_icon.png'>  </div>  <script src='/fe/plugin-runner/rcp-fe-plugin-runner.js?t=${timestamp}'></script></body></html>`, PATCHES_DIR);
 }
 
 function currentWindowScale(win) {
@@ -1121,7 +1231,11 @@ async function extractAsset(urlPath) {
     return null;
   }
 
-  const asset = { buffer: extracted[0].buffer, fileName: path.basename(relativePath) };
+  let buffer = extracted[0].buffer;
+  // Apply on-the-fly patches from patches/ folder
+  buffer = applyPatches(pluginName, relativePath, buffer, PATCHES_DIR);
+
+  const asset = { buffer, fileName: path.basename(relativePath) };
   assetCache.set(cacheKey, asset);
   return asset;
 }

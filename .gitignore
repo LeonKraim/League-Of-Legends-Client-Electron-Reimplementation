@@ -17,3 +17,9 @@ settings.json
 # Build output
 dist/
 
+# Extracted FE assets (NEVER commit — copyrighted material)
+fe_raw/
+
+# Patch cache (runtime-generated)
+patches-cache/
+
