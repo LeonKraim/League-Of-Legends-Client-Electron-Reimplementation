@@ -5,15 +5,9 @@ const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
 const DIST = path.join(ROOT, 'dist');
-const NAME = 'League-Electron-Client';
+const buildId = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+const NAME = `League-Electron-Client-${buildId}`;
 const { version } = require(path.join(ROOT, 'package.json'));
-
-async function clean() {
-  if (fs.existsSync(DIST)) {
-    await fs.promises.rm(DIST, { recursive: true });
-  }
-  await fs.promises.mkdir(DIST, { recursive: true });
-}
 
 async function packageApp() {
   const appPaths = await packager({
@@ -41,7 +35,6 @@ function zipApp(appDir) {
 
 (async () => {
   console.log('Building League Electron Client...');
-  await clean();
   const appDir = await packageApp();
   console.log(`Packaged to ${appDir}`);
   zipApp(appDir);

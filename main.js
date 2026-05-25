@@ -220,12 +220,12 @@ function quotePowerShellSingle(value) {
 }
 
 function startLeagueClient() {
-  // Use RiotClientServices with args to minimize Riot Client window
+  // Use RiotClientServices with args to start Riot Client hidden
   if (cfg.riotClientServicesExe && fs.existsSync(cfg.riotClientServicesExe)) {
     execFile('powershell.exe', [
       '-NoProfile',
       '-Command',
-      "Start-Process -FilePath '.\\RiotClientServices.exe' -ArgumentList '--launch-product=league_of_legends','--launch-patchline=live' -WindowStyle Minimized"
+      "Start-Process -FilePath '.\\RiotClientServices.exe' -ArgumentList '--launch-product=league_of_legends','--launch-patchline=live' -WindowStyle Hidden"
     ], { encoding: 'utf8', cwd: cfg.riotDir }, (error) => {
       if (error && DEBUG) console.error(`[league:start] RiotClientServices error: ${error.message}`);
     });
@@ -403,98 +403,54 @@ async function dismissStockLeagueUx(league, options = {}) {
 }
 
 async function suppressStockLeagueUxAfterLoad(league, options = {}) {
-  const totalMs = options.totalMs || 30000;
   const pollMs = options.pollMs || 1000;
-  const startedAt = Date.now();
-  let lastError = null;
 
-  while (Date.now() - startedAt < totalMs) {
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
     if (readLeagueUxProcess()) {
       try {
         await dismissStockLeagueUx(league, { attempts: 2, delayMs: 500 });
         console.log('[league:kill-ux] dismissed stock League UX window');
-        return true;
       } catch (error) {
-        lastError = error;
+        console.error(`[league:kill-ux] ${error.message}`);
       }
     }
     await delay(pollMs);
   }
-
-  if (lastError) {
-    console.error(`[league:kill-ux] ${lastError.message}`);
-  }
-  return false;
 }
 
-function hideRiotClientSplashWindowsOnce() {
-  // Uses async execFile so it NEVER blocks the Node.js event loop
-  const script = `
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class RiotSplashHider {
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc f, IntPtr l);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
-  public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
-  public static int HideRiotWindows(uint[] riotPids) {
-    int count = 0;
-    EnumWindows((h, l) => {
-      if (!IsWindowVisible(h)) return true;
-      uint procId = 0;
-      GetWindowThreadProcessId(h, out procId);
-      foreach (uint rp in riotPids) {
-        if (procId == rp) {
-          RECT rect;
-          GetWindowRect(h, out rect);
-          int w = rect.R - rect.L, hh = rect.B - rect.T;
-          if (w > 100 && hh > 100) {
-            ShowWindow(h, 6);
-            ShowWindow(h, 0);
-            count++;
-          }
-          break;
-        }
-      }
-      return true;
-    }, IntPtr.Zero);
-    return count;
+let riotTrayMinimizerProcess = null;
+
+function startRiotClientTrayMinimizer() {
+  // Spawns riot-blocker.ps1 as a persistent PowerShell process.
+  // The script compiles C# once and runs a native message pump via
+  // SetWinEventHook + MsgWaitForMultipleObjects, catching Riot Client
+  // window show events and hiding them instantly — zero CPU, zero flash.
+  const blockerScript = path.join(__dirname, 'riot-blocker.ps1');
+  if (!fs.existsSync(blockerScript)) {
+    if (DEBUG) console.error('[riot:tray] riot-blocker.ps1 not found');
+    return;
   }
-}
-"@
-$riotPids = @(Get-Process | Where-Object { $_.Name -like '*Riot Client*' -or $_.Name -like 'LeagueClientUx*' } | Select-Object -ExpandProperty Id)
-if ($riotPids.Count -gt 0) {
-  $hidden = [RiotSplashHider]::HideRiotWindows([uint[]]$riotPids)
-  Write-Output $hidden
-} else {
-  Write-Output 0
-}
-`;
-  return new Promise((resolve) => {
-    execFile('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8' }, (error, stdout) => {
-      if (error) {
-        if (DEBUG) console.error(`[riot:splash] ${error.message}`);
-        return resolve(0);
-      }
-      const count = parseInt((stdout || '').trim(), 10) || 0;
-      if (count > 0) console.log(`[riot:splash] hid ${count} Riot Client window(s)`);
-      resolve(count);
+  try {
+    riotTrayMinimizerProcess = execFile('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', blockerScript
+    ], { encoding: 'utf8' }, (error) => {
+      if (error && DEBUG) console.error(`[riot:tray] minimizer exited: ${error.message}`);
     });
-  });
+    if (DEBUG) console.log('[riot:tray] blocker script started');
+  } catch (error) {
+    if (DEBUG) console.error(`[riot:tray] failed to start minimizer: ${error.message}`);
+  }
 }
 
-async function suppressRiotClientSplash(options = {}) {
-  const totalMs = options.totalMs || 20000;
-  const pollMs = options.pollMs || 2000;
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < totalMs) {
-    await hideRiotClientSplashWindowsOnce();
-    await delay(pollMs);
+function stopRiotClientTrayMinimizer() {
+  if (riotTrayMinimizerProcess) {
+    try {
+      riotTrayMinimizerProcess.kill();
+    } catch (_error) {
+      // Already exited
+    }
+    riotTrayMinimizerProcess = null;
   }
 }
 
@@ -1651,6 +1607,7 @@ async function createWindow() {
   });
 
   await showLoadingScreen(win);
+  startRiotClientTrayMinimizer();
   const startup = await ensureLeagueIsRunning();
   const league = startup.league;
   win.league = league;
@@ -1679,9 +1636,6 @@ async function createWindow() {
   suppressStockLeagueUxAfterLoad(league).catch((error) => {
     console.error(`[league:kill-ux] ${error.message}`);
   });
-  suppressRiotClientSplash().catch((error) => {
-    console.error(`[riot:splash] ${error.message}`);
-  });
 }
 
 if (cfg.configError) {
@@ -1701,6 +1655,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', (event) => {
+  stopRiotClientTrayMinimizer();
   const win = BrowserWindow.getAllWindows()[0];
   if (allowingWindowClose || !win || win.isDestroyed()) return;
   event.preventDefault();
@@ -1712,5 +1667,6 @@ app.on('before-quit', (event) => {
 });
 
 app.on('window-all-closed', () => {
+  stopRiotClientTrayMinimizer();
   if (process.platform !== 'darwin') app.quit();
 });

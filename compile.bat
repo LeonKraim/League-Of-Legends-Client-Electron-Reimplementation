@@ -1,0 +1,6 @@
+@echo off
+echo Cleaning dist...
+if exist dist rmdir /s /q dist
+
+echo Building League Electron Client...
+npm run build
