@@ -251,14 +251,36 @@ function applyRegex(str, pattern, replace, flags) {
 
 function injectCss(str, cssContent, position) {
   const styleTag = `<style data-fe-patcher>${cssContent}</style>`;
-  if (position === 'before' || position === 'prepend') {
+  const headClose = str.indexOf('</head>');
+
+  // 'before' → insert before </head> (fallback: prepend)
+  if (position === 'before') {
+    if (headClose > 0) {
+      return str.slice(0, headClose) + styleTag + str.slice(headClose);
+    }
     return styleTag + '\n' + str;
   }
-  if (position === 'after' || position === 'append') {
+
+  // 'after' → insert after </head> (fallback: append)
+  if (position === 'after') {
+    if (headClose > 0) {
+      const afterHead = headClose + '</head>'.length;
+      return str.slice(0, afterHead) + '\n' + styleTag + str.slice(afterHead);
+    }
     return str + '\n' + styleTag;
   }
-  // before first </head>
-  const headClose = str.indexOf('</head>');
+
+  // 'prepend' → always at the beginning
+  if (position === 'prepend') {
+    return styleTag + '\n' + str;
+  }
+
+  // 'append' → always at the end
+  if (position === 'append') {
+    return str + '\n' + styleTag;
+  }
+
+  // Default: try before </head>, fallback to prepend
   if (headClose > 0) {
     return str.slice(0, headClose) + styleTag + str.slice(headClose);
   }

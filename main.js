@@ -374,193 +374,6 @@ async function ensureLeagueIsRunning() {
   throw new Error(`League client did not become ready within ${LEAGUE_START_TIMEOUT_MS / 1000} seconds.`);
 }
 
-async function requestLeagueUxShutdown(league) {
-  if (!league) return;
-  const result = await requestLeague('/riotclient/kill-ux', league.port, league.token, 'POST');
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.statusCode && result.statusCode >= 400) {
-    throw new Error(`LCU refused UX shutdown with status ${result.statusCode}.`);
-  }
-}
-
-async function dismissStockLeagueUx(league, options = {}) {
-  const attempts = options.attempts || 8;
-  const delayMs = options.delayMs || 750;
-  let lastError = null;
-
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      await requestLeagueUxShutdown(league);
-      return true;
-    } catch (error) {
-      lastError = error;
-      await delay(delayMs);
-    }
-  }
-
-  if (lastError) throw lastError;
-  return false;
-}
-
-async function suppressStockLeagueUxAfterLoad(league, options = {}) {
-  const pollMs = options.pollMs || 1000;
-
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    if (readLeagueUxProcess()) {
-      try {
-        await dismissStockLeagueUx(league, { attempts: 2, delayMs: 500 });
-        console.log('[league:kill-ux] dismissed stock League UX window');
-      } catch (error) {
-        console.error(`[league:kill-ux] ${error.message}`);
-      }
-    }
-    await delay(pollMs);
-  }
-}
-
-
-let riotTrayMinimizerProcess = null;
-
-function startRiotClientTrayMinimizer() {
-  // Writes the C#/PowerShell blocker script to a temp file and spawns it.
-  // SetWinEventHook catches Riot Client windows at creation
-  // (EVENT_OBJECT_CREATE), makes them 100% transparent (WS_EX_LAYERED
-  // with 0 opacity), then hides them when shown (EVENT_OBJECT_SHOW) —
-  // the window is never visible to the user.
-  const os = require('node:os');
-  const tmpFile = path.join(os.tmpdir(), 'rcb-' + process.pid + '.ps1');
-  const script = `Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Diagnostics;
-using System.Linq;
-public class RiotBlocker {
-  [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint eMin, uint eMax, IntPtr hmod, WinEventDelegate d, uint pid, uint tid, uint flags);
-  [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hhk);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc f, IntPtr l);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
-  [DllImport("user32.dll")] public static extern int MsgWaitForMultipleObjects(int n, IntPtr p, bool fWait, int ms, uint mask);
-  [DllImport("user32.dll")] public static extern bool PeekMessage(out MSG m, IntPtr h, uint min, uint max, uint f);
-  [DllImport("user32.dll")] public static extern bool TranslateMessage(ref MSG m);
-  [DllImport("user32.dll")] public static extern bool DispatchMessage(ref MSG m);
-  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int n);
-  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int n, int v);
-  [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint c, byte a, uint f);
-  [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; }
-  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
-  public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
-  public delegate void WinEventDelegate(IntPtr hHook, uint e, IntPtr hwnd, int idObj, int idChild, uint eThread, uint eTime);
-  const uint EVENT_OBJECT_CREATE = 0x8000;
-  const uint EVENT_OBJECT_SHOW = 0x8002;
-  const uint WINEVENT_OUTOFCONTEXT = 0;
-  const uint QS_ALLINPUT = 0xFF;
-  const uint WM_SYSCOMMAND = 0x0112;
-  const uint SC_MINIMIZE = 0xF020;
-  const int GWL_EXSTYLE = -20;
-  const int WS_EX_LAYERED = 0x80000;
-  const uint LWA_ALPHA = 0x2;
-
-  private static WinEventDelegate _del;
-  private static IntPtr _hook;
-  private static uint[] _pids = new uint[0];
-
-  public static void RunForever() {
-    _del = OnEvent;
-    _hook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, IntPtr.Zero, _del, 0, 0, WINEVENT_OUTOFCONTEXT);
-    int lastPidScan = 0;
-    MSG msg;
-    while (true) {
-      while (PeekMessage(out msg, IntPtr.Zero, 0, 0, 1)) {
-        if (msg.message == 0x12) { UnhookWinEvent(_hook); return; }
-        TranslateMessage(ref msg);
-        DispatchMessage(ref msg);
-      }
-      int now = Environment.TickCount;
-      if (now - lastPidScan > 500) {
-        lastPidScan = now;
-        try {
-          _pids = Process.GetProcessesByName("Riot Client").Select(p => (uint)p.Id).ToArray();
-          if (_pids.Length > 0) HideExisting(_pids);
-        } catch { _pids = new uint[0]; }
-      }
-      MsgWaitForMultipleObjects(0, IntPtr.Zero, false, 500, QS_ALLINPUT);
-    }
-  }
-
-  private static void OnEvent(IntPtr hHook, uint e, IntPtr hwnd, int idObj, int idChild, uint eThread, uint eTime) {
-    if (idObj != 0 || hwnd == IntPtr.Zero || _pids.Length == 0) return;
-    uint pid = 0;
-    GetWindowThreadProcessId(hwnd, out pid);
-    foreach (uint tp in _pids) {
-      if (pid == tp) {
-        if (e == EVENT_OBJECT_CREATE) {
-          int ex = GetWindowLong(hwnd, GWL_EXSTYLE);
-          SetWindowLong(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
-          SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
-        } else if (e == EVENT_OBJECT_SHOW) {
-          ShowWindow(hwnd, 6);
-          PostMessage(hwnd, WM_SYSCOMMAND, (IntPtr)SC_MINIMIZE, IntPtr.Zero);
-          ShowWindow(hwnd, 0);
-        }
-        break;
-      }
-    }
-  }
-
-  private static void HideExisting(uint[] pids) {
-    EnumWindows((h, l) => {
-      if (!IsWindowVisible(h)) return true;
-      uint pid = 0;
-      GetWindowThreadProcessId(h, out pid);
-      foreach (uint rp in pids) {
-        if (pid == rp) {
-          RECT r; GetWindowRect(h, out r);
-          if ((r.R - r.L) > 100 && (r.B - r.T) > 100) {
-            ShowWindow(h, 6); PostMessage(h, WM_SYSCOMMAND, (IntPtr)SC_MINIMIZE, IntPtr.Zero); ShowWindow(h, 0);
-          }
-          break;
-        }
-      }
-      return true;
-    }, IntPtr.Zero);
-  }
-}
-"@
-[RiotBlocker]::RunForever()
-`;
-  try {
-    fs.writeFileSync(tmpFile, script, 'utf8');
-    riotTrayMinimizerProcess = require('node:child_process').spawn('powershell.exe', [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tmpFile
-    ], { stdio: 'ignore' });
-    riotTrayMinimizerProcess.on('exit', () => {
-      try { fs.unlinkSync(tmpFile); } catch (_error) {}
-    });
-    if (DEBUG) console.log('[riot:tray] blocker started');
-  } catch (error) {
-    if (DEBUG) console.error(`[riot:tray] failed to start: ${error.message}`);
-    try { fs.unlinkSync(tmpFile); } catch (_error) {}
-  }
-}
-
-function stopRiotClientTrayMinimizer() {
-  if (riotTrayMinimizerProcess) {
-    try {
-      riotTrayMinimizerProcess.kill();
-    } catch (_error) {
-      // Already exited
-    }
-    riotTrayMinimizerProcess = null;
-  }
-}
-
 async function requestLeagueServerShutdown(league) {
   if (!league) return;
 
@@ -1718,7 +1531,6 @@ async function createWindow() {
   });
 
   await showLoadingScreen(win);
-  startRiotClientTrayMinimizer();
   const startup = await ensureLeagueIsRunning();
   const league = startup.league;
   win.league = league;
@@ -1744,9 +1556,6 @@ async function createWindow() {
 
   console.log(`[league] Loading bridge for ${baseUrl}/bootstrap.html`);
   await win.loadURL(`http://127.0.0.1:${bridge.port}/index.html`);
-  suppressStockLeagueUxAfterLoad(league).catch((error) => {
-    console.error(`[league:kill-ux] ${error.message}`);
-  });
 }
 
 if (cfg.configError) {
@@ -1766,7 +1575,6 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', (event) => {
-  stopRiotClientTrayMinimizer();
   const win = BrowserWindow.getAllWindows()[0];
   if (allowingWindowClose || !win || win.isDestroyed()) return;
   event.preventDefault();
@@ -1778,6 +1586,5 @@ app.on('before-quit', (event) => {
 });
 
 app.on('window-all-closed', () => {
-  stopRiotClientTrayMinimizer();
   if (process.platform !== 'darwin') app.quit();
 });

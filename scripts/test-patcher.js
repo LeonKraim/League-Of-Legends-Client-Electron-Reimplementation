@@ -6,12 +6,14 @@
  *   2. Match rules (plugin, file, ext, wildcard)
  *   3. Transform types: replace, regex, prepend, append, inject-css
  *   4. Buffer → patched buffer round-trip
- *   5. Generated HTML patching
+ *   5. Programmatic patch pipeline
+ *   6. HTML patching
  *
  * Usage: node scripts/test-patcher.js
  */
 
 const path = require('node:path');
+const fs = require('node:fs');
 const fePatcher = require('./fe-patcher');
 const { _testing } = fePatcher;
 
@@ -42,12 +44,22 @@ function section(title) {
 section('Test 1: Patch loading');
 
 const patches = fePatcher.loadPatches(PATCHES_DIR);
-assert(patches.length > 0, `Loaded ${patches.length} patch(es)`);
+assert(Array.isArray(patches), 'loadPatches returns an array');
 assert(patches.every(p => typeof p.id === 'string'), 'All patches have an id');
 assert(patches.every(p => Array.isArray(p.transforms)), 'All patches have transforms array');
 
+// Only enabled patches are returned (disabled ones are filtered out)
+const disabled = patches.filter(p => p.enabled === false);
+assert(disabled.length === 0, 'Disabled patches are filtered from results');
+
+const rawFiles = fs.readdirSync(PATCHES_DIR).filter(f => f.endsWith('.patch.js'));
+console.log(`    ${rawFiles.length} .patch.js file(s) on disk, ${patches.length} enabled`);
+
 for (const p of patches) {
-  console.log(`    • ${p.id} [${p.enabled !== false ? 'enabled' : 'disabled'}] — ${p.description || '(no desc)'} — ${p.transforms.length} transform(s)`);
+  console.log(`    • ${p.id} — ${p.description || '(no desc)'} — ${p.transforms.length} transform(s)`);
+}
+if (patches.length === 0) {
+  console.log('    (No enabled patches — remaining tests use programmatic transforms)');
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +188,18 @@ assert(cssResult.includes('<style data-fe-patcher>'), 'inject-css: style tag pre
 assert(cssResult.includes('body { color: red; }'), 'inject-css: CSS content present');
 assert(cssResult.includes('</head>'), 'inject-css: inserted before </head>');
 
+// inject-css with position 'prepend' (always at beginning, no </head> fallback)
+const prependCssResult = fePatcher.applyTransform('some text', {
+  type: 'inject-css', position: 'prepend', content: '.test { }'
+});
+assert(prependCssResult.startsWith('<style data-fe-patcher>.test { }</style>'), 'inject-css prepend: style at start');
+
+// inject-css with position 'append' (always at end)
+const appendCssResult = fePatcher.applyTransform('some text', {
+  type: 'inject-css', position: 'append', content: '.test { }'
+});
+assert(appendCssResult.endsWith('<style data-fe-patcher>.test { }</style>'), 'inject-css append: style at end');
+
 // custom transform
 const customResult = fePatcher.applyTransform('hello', {
   type: 'custom',
@@ -210,12 +234,14 @@ assert(multiStr.startsWith('// top\n'), 'multi-transform prepend on buffer');
 assert(multiStr.endsWith('// bottom\n'), 'multi-transform append on buffer');
 
 // ---------------------------------------------------------------------------
-// Test 5: applyPatches full pipeline
+// Test 5: Programmatic patch pipeline
 // ---------------------------------------------------------------------------
-section('Test 5: Full pipeline — applyPatches() with WAD asset');
+section('Test 5: Programmatic patch pipeline');
 
-// Simulate extracting a CSS file from a WAD
-const cssBuffer = Buffer.from(`
+// Test a realistic chain of transforms on a CSS buffer, simulating
+// what a patch file would do. This works regardless of whether
+// disk-based patches are enabled.
+let cssBuffer = Buffer.from(`
 body {
   background: #010a13;
   color: #f0e6d2;
@@ -225,30 +251,34 @@ body {
 }
 `, 'utf8');
 
-// Apply patches targeting rcp-fe-lol-uikit/main.css
-// This should match patch 02 (uikit-dark-bg) since it's enabled
-const patchedCss = fePatcher.applyPatches(
-  'rcp-fe-lol-uikit',
-  'main.css',
-  cssBuffer,
-  PATCHES_DIR
-);
+cssBuffer = fePatcher.applyTransform(cssBuffer, {
+  type: 'prepend-once', marker: '/* FE-PATCHER:dark-bg */', content: '/* FE-PATCHER:dark-bg */\n'
+});
+cssBuffer = fePatcher.applyTransform(cssBuffer, {
+  type: 'replace', find: 'background: #010a13', replace: 'background: #050d1a !important'
+});
+cssBuffer = fePatcher.applyTransform(cssBuffer, {
+  type: 'append-once', marker: '/* END PATCH */', content: '\n/* END PATCH */'
+});
 
-const patchedCssStr = patchedCss.toString('utf8');
-console.log('  Original CSS size:', cssBuffer.length, 'bytes');
-console.log('  Patched CSS size:', patchedCss.length, 'bytes');
+const patchedCssStr = cssBuffer.toString('utf8');
+console.log('  Patched CSS size:', cssBuffer.length, 'bytes');
 
-// Check that our prepend-once content was added
 assert(
   patchedCssStr.includes('/* FE-PATCHER:dark-bg */'),
-  'full pipeline: prepend-once marker found in patched CSS'
+  'pipeline: prepend-once marker found'
 );
 assert(
   patchedCssStr.includes('background: #050d1a !important'),
-  'full pipeline: injected CSS rule present'
+  'pipeline: background replaced'
 );
+assert(
+  patchedCssStr.includes('/* END PATCH */'),
+  'pipeline: append-once marker found'
+);
+assert(Buffer.isBuffer(cssBuffer), 'pipeline: buffer input → buffer output');
 
-// Test that unmatched assets pass through unchanged
+// Test that unmatched assets pass through applyPatches unchanged
 const jsBuffer = Buffer.from('console.log("hello");', 'utf8');
 const unpatchedJs = fePatcher.applyPatches(
   'rcp-fe-lol-uikit',
@@ -263,17 +293,24 @@ assert(unpatchedJs.toString('utf8') === 'console.log("hello");', 'unmatched asse
 // ---------------------------------------------------------------------------
 section('Test 6: HTML patching');
 
-// Load only HTML-targeted patches
-const htmlPatches = patches.filter(p => (p.target === 'html') && p.enabled !== false);
-assert(htmlPatches.length > 0, 'Found HTML patch(es)');
+// Test patchHtml with programmatic patches via addHtmlPatch
+const htmlPatch = {
+  id: "test-html-patch",
+  enabled: true,
+  transforms: [
+    { type: 'replace', find: 'Starting Electron League Client', replace: 'Patched Electron League Client' },
+    { type: 'inject-css', position: 'before', content: '.test-indicator { display: none; }' },
+    { type: 'append-once', marker: 'TEST PATCH', content: '\n<!-- TEST PATCH -->' },
+  ]
+};
+fePatcher.addHtmlPatch(htmlPatch);
 
-// Use the patchHtml function which filters for 'html' target
 const originalHtml = '<!doctype html><html><head></head><body><h1>Starting Electron League Client</h1></body></html>';
 const patchedHtml = fePatcher.patchHtml(originalHtml, PATCHES_DIR);
 
 assert(patchedHtml.includes('Patched Electron League Client'), 'HTML: title text replaced');
-assert(patchedHtml.includes('.patch-indicator'), 'HTML: CSS class injected');
-assert(patchedHtml.includes('PATCHED v1.0'), 'HTML: patch indicator appended');
+assert(patchedHtml.includes('.test-indicator'), 'HTML: CSS class injected');
+assert(patchedHtml.includes('TEST PATCH'), 'HTML: patch indicator appended');
 
 console.log('  Patched HTML snippet:');
 console.log('  ' + patchedHtml.replace(/\n+/g, '\\n').slice(0, 200) + '...');

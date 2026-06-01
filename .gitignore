@@ -23,3 +23,6 @@ fe_raw/
 # Patch cache (runtime-generated)
 patches-cache/
 
+# Claude Code local settings
+.claude/
+
