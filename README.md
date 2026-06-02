@@ -20,9 +20,9 @@ a documented example patch.
 module.exports = {
   id: "my-patch",           // required: unique identifier
   description: "what it does", // optional
-  enabled: true,            // set to false to disable
+  enabled: true,        
   target: "asset",          // "html" | "asset" | omit for both
-  match: {                  // optional: AND-combined rules
+  match: {                  // optional
     plugin: "rcp-fe-lol-uikit",
     ext: ".css"
   },
